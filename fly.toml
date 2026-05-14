@@ -1,0 +1,29 @@
+# Fly.io config for the intraday watcher.
+# Deploy with:  fly deploy
+
+app = "portfolio-watcher"
+primary_region = "iad"     # us-east — close to Polygon's edge
+
+[build]
+  dockerfile = "Dockerfile.watcher"
+
+[env]
+  PYTHONUNBUFFERED   = "1"
+  WATCHER_POLL_SEC   = "60"
+  PER_TICKER_LIMIT   = "3"
+  WATCHLIST_PATH     = "/data/intraday_watchlist.json"
+  ALERTS_STATE_PATH  = "/data/intraday_alerts_state.json"
+
+[[mounts]]
+  source      = "watcher_data"
+  destination = "/data"
+
+# Single VM, always-on. No HTTP service — this is a worker.
+[[vm]]
+  size       = "shared-cpu-1x"
+  memory     = "512mb"
+  cpu_kind   = "shared"
+  cpus       = 1
+
+[deploy]
+  strategy = "immediate"
