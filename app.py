@@ -50,6 +50,13 @@ LIME = "#9aff5a"
 WARN = "#ff3b3b"
 GRID = "rgba(255,255,255,0.04)"
 
+GRADE_COLORS = {
+    "EXCELLENT": PHOSPHOR,
+    "GOOD": LIME,
+    "WAIT": AMBER,
+    "AVOID": WARN,
+}
+
 
 # ─────────────────────────────────────────────────
 # CSS — Bloomberg-terminal aesthetic (matches single-name-screener)
@@ -449,76 +456,473 @@ def _terminal_layout(height: int = 560) -> dict:
     )
 
 
-def _build_simple_daily_chart(result: dict, show_days: int = 252) -> go.Figure:
-    """A simpler daily chart for the drill-down view — candles + MAs +
-    setup levels drawn as horizontal lines (with diagonal channel rails)."""
+def _build_daily_chart(result: dict, cfg: dict) -> go.Figure:
+    """Annotated daily chart — candles, MAs, RS row, full setup-map overlay
+    (horizontal + diagonal trendlines + channel rails). Mirrors the single-
+    name-screener daily chart exactly so the drill-down visual matches."""
     df = result["df_daily"]
+    spy_df = result.get("df_spy")
+    show_days = cfg["chart"]["daily_show_days"]
     df_view = df.iloc[-show_days:].copy()
+
+    signals = result.get("signals") or {}
+    consol = (signals.get("consolidation") or {})
+    ma_colors = cfg["chart"]["ma_colors"]
+
+    has_rs = spy_df is not None and not spy_df.empty
+    if has_rs:
+        fig = make_subplots(
+            rows=3, cols=1, shared_xaxes=True,
+            row_heights=[0.66, 0.17, 0.17], vertical_spacing=0.03,
+        )
+    else:
+        fig = make_subplots(
+            rows=2, cols=1, shared_xaxes=True,
+            row_heights=[0.78, 0.22], vertical_spacing=0.03,
+        )
+
+    fig.add_trace(
+        go.Candlestick(
+            x=df_view.index, open=df_view["Open"], high=df_view["High"],
+            low=df_view["Low"], close=df_view["Close"], name=result["ticker"],
+            increasing_line_color=PHOSPHOR, decreasing_line_color=WARN,
+            increasing_fillcolor=PHOSPHOR, decreasing_fillcolor=WARN,
+            showlegend=False,
+        ),
+        row=1, col=1,
+    )
+
+    for period, key in [(20, "ma_20"), (50, "ma_50"), (200, "ma_200")]:
+        ma = df["Close"].rolling(period).mean()
+        ma_view = ma.iloc[-show_days:]
+        fig.add_trace(
+            go.Scatter(
+                x=ma_view.index, y=ma_view.values, mode="lines",
+                name=f"MA{period}", line=dict(color=ma_colors[key], width=1.2),
+            ),
+            row=1, col=1,
+        )
+
+    if consol.get("signal") and consol["signal"] != "NONE":
+        fig.add_hrect(
+            y0=consol["range_low"], y1=consol["range_high"],
+            fillcolor="rgba(0, 217, 255, 0.04)", line_width=0, row=1, col=1,
+        )
+
+    breakouts = list(result.get("breakouts", []))[:6]
+    breakdowns = list(result.get("breakdowns", []))[:6]
+    triggered = list(result.get("triggered", []))[:4]
+    setup_level_lines: list[tuple[float, str, str, str, float, str]] = []
+    diagonal_lines: list[tuple[dict, str, str, str, float]] = []
+
+    def _style_for(s):
+        if s.direction == "BREAKOUT":
+            if s.quality_label == "STRONG":
+                return PHOSPHOR, "solid", 1.4
+            if s.quality_label == "MODERATE":
+                return LIME, "dash", 1.1
+            return AMBER, "dot", 0.9
+        if s.quality_label == "STRONG":
+            return WARN, "solid", 1.4
+        if s.quality_label == "MODERATE":
+            return "#ff7a7a", "dash", 1.1
+        return "#ffd166", "dot", 0.9
+
+    for s in breakouts + breakdowns:
+        if s.kind.startswith("CHANNEL_WEEKLY_"):
+            continue
+        color, dash, width = _style_for(s)
+        if s.line_meta:
+            diagonal_lines.append((s.line_meta, color, dash, s.label, width))
+        else:
+            setup_level_lines.append((s.trigger_price, color, dash, s.label, width, "right"))
+    for s in triggered:
+        if s.kind.startswith("CHANNEL_WEEKLY_"):
+            continue
+        muted = "rgba(0,255,140,0.45)" if s.direction == "BREAKOUT" else "rgba(255,59,59,0.45)"
+        if s.line_meta:
+            diagonal_lines.append((s.line_meta, muted, "dot", f"{s.label} (crossed)", 0.8))
+        else:
+            setup_level_lines.append((
+                s.trigger_price, muted, "dot", f"{s.label} (crossed)", 0.8, "left",
+            ))
+
+    candle_low = float(df_view["Low"].min())
+    candle_high = float(df_view["High"].max())
+    y_pad_lo = candle_low * 0.95
+    y_pad_hi = candle_high * 1.05
+    for s in breakouts:
+        if candle_high < s.trigger_price <= candle_high * 1.15:
+            y_pad_hi = max(y_pad_hi, s.trigger_price * 1.02)
+    for s in breakdowns:
+        if candle_low * 0.85 <= s.trigger_price < candle_low:
+            y_pad_lo = min(y_pad_lo, s.trigger_price * 0.98)
+    off_chart_labels: list[str] = []
+
+    for y, color, dash, label, width, position in setup_level_lines:
+        if y_pad_lo <= y <= y_pad_hi:
+            fig.add_hline(
+                y=y, line=dict(color=color, width=width, dash=dash),
+                annotation_text=f"${y:.2f} {label.upper()}",
+                annotation_position=position,
+                annotation_font=dict(color=color, size=10, family="JetBrains Mono"),
+                row=1, col=1,
+            )
+        else:
+            if y > candle_high:
+                pct = (y / candle_high - 1) * 100
+            else:
+                pct = (y / candle_low - 1) * 100
+            off_chart_labels.append(f"{label.upper()} ${y:.2f} ({pct:+.0f}%)")
+
+    view_start = df_view.index[0]
+    for lm, color, dash, label, width in diagonal_lines:
+        try:
+            x0, x1 = lm["x0"], lm["x1"]
+            y0, y1 = float(lm["y0"]), float(lm["y1"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        x0_clamped = x0 if x0 >= view_start else view_start
+        if x0 < view_start and x1 != x0:
+            try:
+                total = (x1 - x0).total_seconds()
+                frac = (view_start - x0).total_seconds() / total if total else 0
+                y0_clamped = y0 + (y1 - y0) * frac
+            except Exception:
+                y0_clamped = y0
+        else:
+            y0_clamped = y0
+        fig.add_shape(
+            type="line",
+            x0=x0_clamped, y0=y0_clamped, x1=x1, y1=y1,
+            line=dict(color=color, width=width, dash=dash),
+            xref="x", yref="y", row=1, col=1,
+        )
+        fig.add_annotation(
+            x=x1, y=y1,
+            text=f"{label.upper()} ${y1:.2f}",
+            showarrow=False,
+            font=dict(color=color, size=10, family="JetBrains Mono"),
+            xanchor="right", yanchor="bottom",
+            row=1, col=1,
+        )
+
+    colors = [PHOSPHOR if c >= o else WARN for o, c in zip(df_view["Open"], df_view["Close"])]
+    fig.add_trace(
+        go.Bar(
+            x=df_view.index, y=df_view["Volume"], marker_color=colors,
+            name="Volume", showlegend=False, opacity=0.55,
+        ),
+        row=2, col=1,
+    )
+
+    if has_rs:
+        joined = pd.DataFrame({"t": df["Close"], "s": spy_df["Close"]}).dropna()
+        if not joined.empty:
+            rs = joined["t"] / joined["s"]
+            rs_norm = rs / float(rs.iloc[max(0, len(rs) - show_days)])
+            rs_view = rs_norm.iloc[-show_days:]
+            rs_ma20 = rs_norm.rolling(20).mean().iloc[-show_days:]
+            fig.add_trace(
+                go.Scatter(
+                    x=rs_view.index, y=rs_view.values, mode="lines",
+                    name="RS vs SPY", line=dict(color=CYAN, width=1.2),
+                ),
+                row=3, col=1,
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=rs_ma20.index, y=rs_ma20.values, mode="lines",
+                    name="RS MA(20)", line=dict(color=CYAN, width=0.8, dash="dot"),
+                ),
+                row=3, col=1,
+            )
+            fig.add_hline(
+                y=1.0, line=dict(color=TEXT_2, width=0.8, dash="dash"),
+                row=3, col=1,
+            )
+
+    eq = result.get("entry_quality") or {}
+    grade = eq.get("grade")
+    score = eq.get("grade_score")
+    if grade is not None:
+        fig.add_annotation(
+            xref="paper", yref="paper", x=0.99, y=0.99,
+            text=f"<b>{grade}</b>  ·  {score}",
+            showarrow=False,
+            bgcolor=GRADE_COLORS.get(grade, AMBER),
+            bordercolor="rgba(0,0,0,0)",
+            font=dict(color=BG_0, size=12, family="JetBrains Mono"),
+            align="right",
+        )
+
+    fresh_today = [
+        s for s in triggered
+        if s.bars_since_trigger == 0 and s.timeframe == "daily"
+    ]
+    if fresh_today:
+        s = max(fresh_today, key=lambda x: x.quality)
+        if s.direction == "BREAKOUT":
+            stamp_text = "▲ BREAKOUT CLEARED"
+            stamp_color = PHOSPHOR
+            stamp_bg = "rgba(0, 255, 140, 0.18)"
+        else:
+            stamp_text = "▼ BREAKDOWN TRIGGERED"
+            stamp_color = WARN
+            stamp_bg = "rgba(255, 59, 59, 0.18)"
+        fig.add_annotation(
+            xref="paper", yref="paper", x=0.01, y=0.99,
+            text=(
+                f"<b>{stamp_text}</b><br>"
+                f"<span style='font-size:11px;'>"
+                f"{html_mod.escape(s.label)} · ${s.trigger_price:.2f}"
+                f"</span>"
+            ),
+            showarrow=False,
+            bgcolor=stamp_bg,
+            bordercolor=stamp_color,
+            borderwidth=1, borderpad=8,
+            font=dict(color=stamp_color, size=16, family="JetBrains Mono"),
+            align="left", xanchor="left", yanchor="top",
+        )
+
+    if off_chart_labels:
+        fig.add_annotation(
+            xref="paper", yref="paper", x=0.99, y=0.92,
+            text="<br>".join(off_chart_labels),
+            showarrow=False,
+            bgcolor="rgba(168, 85, 247, 0.18)",
+            bordercolor="#a855f7",
+            borderwidth=1, borderpad=4,
+            font=dict(color="#c084fc", size=10, family="JetBrains Mono"),
+            align="right", xanchor="right", yanchor="top",
+        )
+
+    fig.update_layout(**_terminal_layout(height=720 if has_rs else 620))
+
+    visible_dates = pd.DatetimeIndex([ts.normalize() for ts in df_view.index]).unique()
+    if len(visible_dates):
+        full_weekdays = pd.bdate_range(visible_dates.min(), visible_dates.max())
+        missing = sorted(set(full_weekdays) - set(visible_dates))
+        rangebreaks = [dict(bounds=["sat", "mon"])]
+        if missing:
+            rangebreaks.append(dict(values=[d.strftime("%Y-%m-%d") for d in missing]))
+        fig.update_xaxes(rangebreaks=rangebreaks)
+    else:
+        fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
+
+    use_log = False
+    if cfg["chart"].get("auto_log_scale", True) and candle_low > 0:
+        range_pct = (candle_high - candle_low) / candle_low * 100
+        use_log = range_pct >= cfg["chart"].get("log_scale_threshold_pct", 50)
+
+    y_range = [math.log10(y_pad_lo), math.log10(y_pad_hi)] if use_log else [y_pad_lo, y_pad_hi]
+
+    fig.update_yaxes(
+        dict(
+            title=dict(text="PRICE", font=dict(family="JetBrains Mono", size=10, color=TEXT_2)),
+            type="log" if use_log else "linear",
+            range=y_range,
+        ),
+        row=1, col=1,
+    )
+    fig.update_yaxes(title=dict(text="VOL", font=dict(family="JetBrains Mono", size=10, color=TEXT_2)), row=2, col=1)
+    if has_rs:
+        fig.update_yaxes(title=dict(text="RS", font=dict(family="JetBrains Mono", size=10, color=TEXT_2)), row=3, col=1)
+    return fig
+
+
+def _build_weekly_chart(result: dict, cfg: dict) -> go.Figure | None:
+    """Weekly candlestick chart with 10W/40W MAs, weekly-pattern overlays, and
+    weekly-channel rails. Mirrors the single-name-screener weekly chart."""
+    df_weekly = result.get("df_weekly")
+    if df_weekly is None or df_weekly.empty:
+        return None
+
+    show_weeks = cfg["chart"].get("weekly_show_weeks", 104)
+    df_view = df_weekly.iloc[-show_weeks:].copy()
+    if df_view.empty:
+        return None
+
+    weekly_pats = result.get("weekly_patterns") or []
 
     fig = make_subplots(
         rows=2, cols=1, shared_xaxes=True,
         row_heights=[0.78, 0.22], vertical_spacing=0.03,
     )
-    fig.add_trace(go.Candlestick(
-        x=df_view.index, open=df_view["Open"], high=df_view["High"],
-        low=df_view["Low"], close=df_view["Close"], name=result["ticker"],
-        increasing_line_color=PHOSPHOR, decreasing_line_color=WARN,
-        increasing_fillcolor=PHOSPHOR, decreasing_fillcolor=WARN,
-        showlegend=False,
-    ), row=1, col=1)
 
-    for period, color in [(20, "#3b82f6"), (50, "#f97316"), (200, "#ef4444")]:
-        ma = df["Close"].rolling(period).mean().iloc[-show_days:]
-        fig.add_trace(go.Scatter(
-            x=ma.index, y=ma.values, mode="lines",
-            name=f"MA{period}", line=dict(color=color, width=1.2),
-        ), row=1, col=1)
+    fig.add_trace(
+        go.Candlestick(
+            x=df_view.index, open=df_view["Open"], high=df_view["High"],
+            low=df_view["Low"], close=df_view["Close"], name=result["ticker"],
+            increasing_line_color=PHOSPHOR, decreasing_line_color=WARN,
+            increasing_fillcolor=PHOSPHOR, decreasing_fillcolor=WARN,
+            showlegend=False,
+        ),
+        row=1, col=1,
+    )
 
-    # Draw top setup levels (skip weekly channels — those belong on weekly chart)
+    for period, label, color in [
+        (10, "10W MA", "#3b82f6"),
+        (40, "40W MA", "#ef4444"),
+    ]:
+        ma = df_weekly["Close"].rolling(period).mean()
+        ma_view = ma.iloc[-show_weeks:]
+        fig.add_trace(
+            go.Scatter(
+                x=ma_view.index, y=ma_view.values, mode="lines",
+                name=label, line=dict(color=color, width=1.2),
+            ),
+            row=1, col=1,
+        )
+
     candle_low = float(df_view["Low"].min())
     candle_high = float(df_view["High"].max())
-    y_pad_lo, y_pad_hi = candle_low * 0.95, candle_high * 1.05
+    y_pad_lo = candle_low * 0.97
+    y_pad_hi = candle_high * 1.05
+    pats_sorted = sorted(weekly_pats, key=lambda p: p.confidence, reverse=True)
+    if pats_sorted and pats_sorted[0].confidence >= 0.15 and pats_sorted[0].target:
+        tg = float(pats_sorted[0].target)
+        if candle_high < tg <= candle_high * 1.20:
+            y_pad_hi = max(y_pad_hi, tg * 1.02)
 
-    for s in (result.get("breakouts") or [])[:5] + (result.get("breakdowns") or [])[:5]:
-        if s.kind.startswith("CHANNEL_WEEKLY_"):
+    off_chart_labels: list[str] = []
+    for p in pats_sorted[:2]:
+        if p.confidence < 0.15:
             continue
-        if s.line_meta:
-            try:
-                fig.add_shape(
-                    type="line",
-                    x0=s.line_meta["x0"], y0=float(s.line_meta["y0"]),
-                    x1=s.line_meta["x1"], y1=float(s.line_meta["y1"]),
-                    line=dict(
-                        color=PHOSPHOR if s.direction == "BREAKOUT" else WARN,
-                        width=1.2, dash="dash"
-                    ),
-                    xref="x", yref="y", row=1, col=1,
-                )
-            except Exception:
-                pass
-        elif y_pad_lo <= s.trigger_price <= y_pad_hi:
-            color = PHOSPHOR if s.direction == "BREAKOUT" else WARN
+        if y_pad_lo <= p.breakout_level <= y_pad_hi:
             fig.add_hline(
-                y=s.trigger_price,
-                line=dict(color=color, width=1.0, dash="dash"),
-                annotation_text=f"${s.trigger_price:.2f}",
-                annotation_position="right",
-                annotation_font=dict(color=color, size=10, family="JetBrains Mono"),
+                y=p.breakout_level,
+                line=dict(color="#a855f7", width=1.2, dash="dash"),
+                annotation_text=f"{p.pattern.upper()} ${p.breakout_level:.2f}",
+                annotation_position="left",
+                annotation_font=dict(color="#c084fc", size=10, family="JetBrains Mono"),
                 row=1, col=1,
             )
+        else:
+            pct = (p.breakout_level / candle_high - 1) * 100
+            off_chart_labels.append(
+                f"{p.pattern.upper()} ${p.breakout_level:.2f} ({pct:+.0f}% off-chart)"
+            )
+        if p.target:
+            if y_pad_lo <= p.target <= y_pad_hi:
+                fig.add_hline(
+                    y=p.target,
+                    line=dict(color="#a855f7", width=1, dash="dot"),
+                    annotation_text=f"TGT ${p.target:.2f}",
+                    annotation_position="left",
+                    annotation_font=dict(color="#c084fc", size=10, family="JetBrains Mono"),
+                    row=1, col=1,
+                )
+            else:
+                pct = (p.target / candle_high - 1) * 100
+                off_chart_labels.append(f"TGT ${p.target:.2f} ({pct:+.0f}% off-chart)")
 
     colors = [PHOSPHOR if c >= o else WARN for o, c in zip(df_view["Open"], df_view["Close"])]
-    fig.add_trace(go.Bar(
-        x=df_view.index, y=df_view["Volume"], marker_color=colors,
-        name="Volume", showlegend=False, opacity=0.55,
-    ), row=2, col=1)
+    fig.add_trace(
+        go.Bar(
+            x=df_view.index, y=df_view["Volume"], marker_color=colors,
+            name="Volume", showlegend=False, opacity=0.55,
+        ),
+        row=2, col=1,
+    )
 
-    fig.update_layout(**_terminal_layout(height=560))
-    fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
+    view_start = df_view.index[0]
+    for s in (
+        list(result.get("breakouts", []))
+        + list(result.get("breakdowns", []))
+        + list(result.get("triggered", []))
+    ):
+        if not s.kind.startswith("CHANNEL_WEEKLY_"):
+            continue
+        if not s.line_meta:
+            continue
+        is_triggered = getattr(s, "is_triggered", False)
+        if s.direction == "BREAKOUT":
+            color = PHOSPHOR if s.quality_label == "STRONG" else LIME
+        else:
+            color = WARN if s.quality_label == "STRONG" else "#ff7a7a"
+        if is_triggered:
+            color = "rgba(0,255,140,0.45)" if s.direction == "BREAKOUT" else "rgba(255,59,59,0.45)"
+            dash = "dot"
+            width = 0.9
+            label_suffix = " (crossed)"
+        elif s.quality_label == "STRONG":
+            dash, width = "solid", 1.5
+            label_suffix = ""
+        elif s.quality_label == "MODERATE":
+            dash, width = "dash", 1.2
+            label_suffix = ""
+        else:
+            dash, width = "dot", 1.0
+            label_suffix = ""
+        lm = s.line_meta
+        try:
+            x0 = lm["x0"]; x1 = lm["x1"]
+            y0 = float(lm["y0"]); y1 = float(lm["y1"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        x0_clamped = x0 if x0 >= view_start else view_start
+        if x0 < view_start and x1 != x0:
+            try:
+                total = (x1 - x0).total_seconds()
+                frac = (view_start - x0).total_seconds() / total if total else 0
+                y0_clamped = y0 + (y1 - y0) * frac
+            except Exception:
+                y0_clamped = y0
+        else:
+            y0_clamped = y0
+        fig.add_shape(
+            type="line",
+            x0=x0_clamped, y0=y0_clamped, x1=x1, y1=y1,
+            line=dict(color=color, width=width, dash=dash),
+            xref="x", yref="y", row=1, col=1,
+        )
+        fig.add_annotation(
+            x=x1, y=y1,
+            text=f"{s.label.upper()}{label_suffix} ${y1:.2f}",
+            showarrow=False,
+            font=dict(color=color, size=10, family="JetBrains Mono"),
+            xanchor="right", yanchor="bottom",
+            row=1, col=1,
+        )
+
+    if off_chart_labels:
+        fig.add_annotation(
+            xref="paper", yref="paper", x=0.99, y=0.99,
+            text="<br>".join(off_chart_labels),
+            showarrow=False,
+            bgcolor="rgba(168, 85, 247, 0.18)",
+            bordercolor="#a855f7",
+            borderwidth=1, borderpad=4,
+            font=dict(color="#c084fc", size=10, family="JetBrains Mono"),
+            align="right", xanchor="right", yanchor="top",
+        )
+
+    fig.update_layout(**_terminal_layout(height=520))
+
+    use_log = False
+    if cfg["chart"].get("auto_log_scale", True) and candle_low > 0:
+        range_pct = (candle_high - candle_low) / candle_low * 100
+        use_log = range_pct >= cfg["chart"].get("log_scale_threshold_pct", 50)
+    y_range = [math.log10(y_pad_lo), math.log10(y_pad_hi)] if use_log else [y_pad_lo, y_pad_hi]
+
+    fig.update_yaxes(
+        dict(
+            title=dict(text="PRICE", font=dict(family="JetBrains Mono", size=10, color=TEXT_2)),
+            type="log" if use_log else "linear",
+            range=y_range,
+        ),
+        row=1, col=1,
+    )
+    fig.update_yaxes(
+        title=dict(text="VOL", font=dict(family="JetBrains Mono", size=10, color=TEXT_2)),
+        row=2, col=1,
+    )
     return fig
 
 
-def _render_drilldown(read: ps.ActionableRead) -> None:
+def _render_drilldown(read: ps.ActionableRead, cfg: dict) -> None:
     r = read.result
     _section_label(f"DRILL-DOWN · {read.ticker}", accent=read.color)
     st.markdown(
@@ -528,7 +932,22 @@ def _render_drilldown(read: ps.ActionableRead) -> None:
         f"</div>",
         unsafe_allow_html=True,
     )
-    st.plotly_chart(_build_simple_daily_chart(r), use_container_width=True)
+
+    st.markdown(
+        "<div style='font-family:var(--mono); font-size:0.68rem; letter-spacing:0.14em; "
+        "color:var(--text-2); text-transform:uppercase; margin-top:6px;'>Daily</div>",
+        unsafe_allow_html=True,
+    )
+    st.plotly_chart(_build_daily_chart(r, cfg), use_container_width=True)
+
+    weekly_fig = _build_weekly_chart(r, cfg)
+    if weekly_fig is not None:
+        st.markdown(
+            "<div style='font-family:var(--mono); font-size:0.68rem; letter-spacing:0.14em; "
+            "color:var(--text-2); text-transform:uppercase; margin-top:14px;'>Weekly</div>",
+            unsafe_allow_html=True,
+        )
+        st.plotly_chart(weekly_fig, use_container_width=True)
 
     with st.expander("COMMENTARY · FULL NARRATIVE", expanded=False):
         md = commentary_mod.generate_commentary(r)
@@ -642,7 +1061,7 @@ def main() -> None:
         st.session_state.drill_ticker = selected
         read = next((r for r in reads if r.ticker == selected), None)
         if read is not None and not read.result.get("error"):
-            _render_drilldown(read)
+            _render_drilldown(read, cfg)
         elif read is not None:
             st.error(f"{selected} — analysis error: {read.result.get('error')}")
 
