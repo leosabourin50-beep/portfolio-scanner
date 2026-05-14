@@ -1,0 +1,57 @@
+name: Portfolio Scanner Cron
+
+on:
+  # Every 30 min during US market hours, Mon-Fri.
+  # 13:30–20:30 UTC = 9:30 AM – 4:30 PM ET (during DST). The window is
+  # widened by 30 min on each side so EST (winter, UTC-5) is also covered.
+  schedule:
+    - cron: '*/30 13-21 * * 1-5'
+  # Manual trigger from the Actions UI for testing.
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (skip Telegram send)'
+        required: false
+        default: 'false'
+
+permissions:
+  contents: write    # so the job can commit .alerts_state.json back
+
+concurrency:
+  group: scanner-cron
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scanner
+        env:
+          POLYGON_API_KEY:    ${{ secrets.POLYGON_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          DRY_RUN:            ${{ github.event.inputs.dry_run == 'true' && '1' || '0' }}
+        run: python scanner_cron.py
+
+      - name: Commit alert state if changed
+        run: |
+          if [[ -n "$(git status --porcelain .alerts_state.json)" ]]; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add .alerts_state.json
+            git commit -m "chore: update alert dedup state [skip ci]"
+            git push
+          else
+            echo "No state changes to commit."
+          fi
