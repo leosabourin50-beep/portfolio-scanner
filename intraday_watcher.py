@@ -316,15 +316,18 @@ def fetch_latest_5m_bar(ticker: str) -> dict | None:
 # Telegram delivery
 # ─────────────────────────────────────────────────────────────
 
-def _send_telegram(text: str) -> None:
+def _send_telegram(text: str) -> bool:
+    """Return True iff the message was successfully delivered (or simulated
+    in DRY_RUN). False means the caller should NOT mark the alert as
+    delivered — so the next poll will retry it instead of silently deduping."""
     if os.environ.get("DRY_RUN") == "1":
         print("[DRY_RUN] would send:\n" + text + "\n---")
-        return
+        return True
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
         print("[skip] TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set", file=sys.stderr)
-        return
+        return False
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = urllib.parse.urlencode({
         "chat_id": chat_id,
@@ -334,9 +337,15 @@ def _send_telegram(text: str) -> None:
     }).encode()
     try:
         with urllib.request.urlopen(urllib.request.Request(url, data=payload), timeout=15) as resp:
-            resp.read()
+            body = resp.read()
+        # Telegram returns 200 with {"ok": true} on success
+        if b'"ok":true' in body:
+            return True
+        print(f"[error] Telegram send returned non-ok: {body[:200]!r}", file=sys.stderr)
+        return False
     except Exception as e:
         print(f"[error] Telegram send failed: {e}", file=sys.stderr)
+        return False
 
 
 def format_alert(ticker: str, setup: WatchSetup, bar: dict) -> str:
@@ -466,10 +475,15 @@ def check_once(watchlist: dict[str, list[WatchSetup]]) -> int:
             if key in already:
                 continue
             if is_cross(bar, s):
-                _send_telegram(format_alert(ticker, s, bar))
-                already.add(key)
-                sent += 1
-                print(f"[alert] {ticker} {s.direction} {s.kind} @ ${s.trigger:.2f}")
+                if _send_telegram(format_alert(ticker, s, bar)):
+                    already.add(key)
+                    sent += 1
+                    print(f"[alert] {ticker} {s.direction} {s.kind} @ ${s.trigger:.2f}")
+                else:
+                    print(
+                        f"[retry] {ticker} {s.kind} delivery failed — will retry next poll",
+                        file=sys.stderr,
+                    )
 
     if sent:
         state["alerted"] = sorted(already)

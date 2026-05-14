@@ -107,15 +107,19 @@ def alert_key(read: ps.ActionableRead) -> str:
 # Telegram delivery
 # ─────────────────────────────────────────────────────────────
 
-def _send_telegram(text: str) -> None:
+def _send_telegram(text: str) -> bool:
+    """Return True iff the message was successfully delivered. Caller MUST
+    check the return and only mark an alert as deduped on True — otherwise
+    a failed Telegram send (bad token, network blip) silently dedupes the
+    alert forever and the user never sees the ping."""
     if os.environ.get("DRY_RUN") == "1":
         print("[DRY_RUN] would send:\n" + text + "\n---")
-        return
+        return True
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
         print("[skip] TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set", file=sys.stderr)
-        return
+        return False
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = urllib.parse.urlencode({
         "chat_id": chat_id,
@@ -126,9 +130,14 @@ def _send_telegram(text: str) -> None:
     req = urllib.request.Request(url, data=payload)
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
-            resp.read()
+            body = resp.read()
+        if b'"ok":true' in body:
+            return True
+        print(f"[error] Telegram send returned non-ok: {body[:200]!r}", file=sys.stderr)
+        return False
     except Exception as e:
         print(f"[error] Telegram send failed: {e}", file=sys.stderr)
+        return False
 
 
 def format_message(read: ps.ActionableRead) -> str:
@@ -191,16 +200,28 @@ def main() -> int:
         if key in already:
             continue
         new_alerts.append(r)
-        already.add(key)
 
     if not new_alerts:
         print(f"[done] {len(actionable)} actionable, all already alerted today")
         return 0
 
-    print(f"[alert] sending {len(new_alerts)} new alerts")
+    print(f"[alert] attempting {len(new_alerts)} new alerts")
+    # Best-effort send the batch header — even if it fails, the per-ticker
+    # messages below carry their own context so the user still gets the data.
     _send_telegram(format_batch_header(len(new_alerts), len(tickers)))
+
+    delivered = 0
     for r in new_alerts:
-        _send_telegram(format_message(r))
+        if _send_telegram(format_message(r)):
+            already.add(alert_key(r))
+            delivered += 1
+        else:
+            print(f"[retry] {r.ticker} delivery failed — will retry next run", file=sys.stderr)
+
+    if delivered != len(new_alerts):
+        print(f"[done] delivered {delivered}/{len(new_alerts)} — undelivered will retry", file=sys.stderr)
+    else:
+        print(f"[done] delivered {delivered}/{len(new_alerts)} alerts")
 
     state["alerted"] = sorted(already)
     save_state(state)
