@@ -82,6 +82,19 @@ _52W_HIGH_KINDS = {"DONCHIAN_252_HIGH", "WEEKLY_52W_HIGH"}
 _52W_LOW_KINDS  = {"DONCHIAN_252_LOW", "WEEKLY_52W_LOW"}
 
 
+def _is_channel_kind(kind: str) -> bool:
+    """Channel rail setups get wick-based 'rail touch' alerts — a tag in
+    formatted alerts and bypassed close-buffer logic, since touching the
+    rail (even on a wick that rejects) is itself the signal."""
+    return kind.startswith("CHANNEL_")
+
+
+# Rebuild the watchlist mid-day to catch setups that only formed after the
+# morning scan — e.g., a fresh pattern that triggered into IMMEDIATE proximity
+# during the session. Hours expressed in ET.
+MIDDAY_REBUILD_HOURS = (12, 14)  # 12:00 ET and 14:00 ET
+
+
 # ─────────────────────────────────────────────────────────────
 # Watchlist data model
 # ─────────────────────────────────────────────────────────────
@@ -165,11 +178,20 @@ def build_watchlist(tickers: list[str]) -> dict[str, list[WatchSetup]]:
         atr = _atr_from_result(r.result)
         candidates: list[WatchSetup] = []
 
-        # Pending STRONG setups within 5% — watcher pings on first cross
+        def _qualifies(s) -> bool:
+            """STRONG within 5% OR MODERATE within 2% — looser net so things
+            like a MODERATE inverse H&S sitting right at the neckline get
+            watched alongside the pure A+ setups."""
+            d = abs(s.distance_pct)
+            if s.quality_label == "STRONG" and d <= 5.0:
+                return True
+            if s.quality_label == "MODERATE" and d <= 2.0:
+                return True
+            return False
+
+        # Pending setups
         for s in list(r.result.get("breakouts") or []) + list(r.result.get("breakdowns") or []):
-            if s.quality_label != "STRONG":
-                continue
-            if abs(s.distance_pct) > 5.0:
+            if not _qualifies(s):
                 continue
             candidates.append(WatchSetup(
                 kind=s.kind,
@@ -181,13 +203,13 @@ def build_watchlist(tickers: list[str]) -> dict[str, list[WatchSetup]]:
                 is_follow_through=False,
             ))
 
-        # Recently-triggered STRONG setups — watcher pings on follow-through
-        # (close >= trigger + 0.5 ATR for breakouts, symmetric for breakdowns)
-        # so we capture continuation moves the strict-pending watcher misses.
+        # Recently-triggered setups → follow-through (close >= trigger + 0.5
+        # ATR for breakouts, symmetric for breakdowns) so we capture
+        # continuation moves the strict-pending watcher would miss.
         for s in list(r.result.get("triggered") or []):
-            if s.quality_label != "STRONG":
-                continue
             if (s.bars_since_trigger or 0) > 5:
+                continue
+            if s.quality_label not in ("STRONG", "MODERATE"):
                 continue
             candidates.append(WatchSetup(
                 kind=s.kind,
@@ -369,6 +391,21 @@ def format_alert(ticker: str, setup: WatchSetup, bar: dict) -> str:
             f"<i>{bar_time_et}</i>",
         ])
 
+    # Channel rail touch — distinct from a breakout ping
+    if _is_channel_kind(setup.kind):
+        rail_side = "UPPER" if "UPPER" in setup.kind else ("LOWER" if "LOWER" in setup.kind else "RAIL")
+        tf = "WEEKLY" if "WEEKLY" in setup.kind else "DAILY"
+        slope = "ASCENDING" if "ASCENDING" in setup.kind else (
+                "DESCENDING" if "DESCENDING" in setup.kind else "CHANNEL")
+        touched_price = bar["high"] if setup.direction == "BREAKOUT" else bar["low"]
+        chg = (touched_price - setup.trigger) / setup.trigger * 100
+        return "\n".join([
+            f"<b>📍 CHANNEL TOUCH — {ticker}</b>",
+            f"<code>${touched_price:.2f}</code>  ({chg:+.2f}% vs rail)",
+            f"{tf} {slope} channel — {rail_side.lower()} rail at <code>${setup.trigger:.2f}</code>",
+            f"<i>{bar_time_et}</i>",
+        ])
+
     arrow = "▲" if setup.direction == "BREAKOUT" else "▼"
     if setup.is_follow_through:
         side = "FOLLOW-THROUGH" + ("" if setup.direction == "BREAKOUT" else " ↓")
@@ -404,6 +441,14 @@ def is_cross(bar: dict, setup: WatchSetup) -> bool:
         return bar["high"] > setup.trigger
     if setup.kind in _52W_LOW_KINDS:
         return bar["low"] < setup.trigger
+
+    # Channel rail TOUCH — wick-based, fires when price reaches the rail
+    # in the direction the analyzer flagged. Captures both reversal and
+    # breakout scenarios; user decides what to do from the chart.
+    if _is_channel_kind(setup.kind):
+        if setup.direction == "BREAKOUT":
+            return bar["high"] >= setup.trigger
+        return bar["low"] <= setup.trigger
 
     atr_mult = ATR_FOLLOW_THROUGH if setup.is_follow_through else ATR_CONFIRMATION
     buffer = max(setup.atr * atr_mult, setup.trigger * 0.0005)
@@ -512,6 +557,14 @@ def ensure_today_watchlist(portfolio: list[str]) -> dict[str, list[WatchSetup]]:
     return watchlist
 
 
+def _force_rebuild_watchlist(portfolio: list[str]) -> dict[str, list[WatchSetup]]:
+    print("[watchlist] mid-day rebuild — re-scanning to catch newly-formed setups")
+    watchlist = build_watchlist(portfolio)
+    save_watchlist(watchlist)
+    print(f"[watchlist] rebuilt: {sum(len(v) for v in watchlist.values())} levels across {len(watchlist)} tickers")
+    return watchlist
+
+
 def main_loop() -> int:
     portfolio = load_portfolio()
     if not portfolio:
@@ -520,6 +573,7 @@ def main_loop() -> int:
     print(f"[start] intraday watcher | poll {POLL_SEC}s | portfolio: {portfolio}")
 
     watchlist: dict[str, list[WatchSetup]] = {}
+    rebuilt_hours_today: set[int] = set()
 
     while True:
         try:
@@ -529,6 +583,9 @@ def main_loop() -> int:
             if state in ("weekend", "closed_weekday", "pre"):
                 wait = min(seconds_until_open(now), 3600)  # cap at 1 hour
                 print(f"[sleep] market state={state}, sleeping {int(wait)}s")
+                # New trading day starts after a sleep through the close — clear
+                # the rebuild bookkeeping so tomorrow's mid-day rebuilds fire.
+                rebuilt_hours_today.clear()
                 time.sleep(max(wait, 60))
                 continue
 
@@ -541,9 +598,20 @@ def main_loop() -> int:
 
             # state == "open"
             watchlist = ensure_today_watchlist(portfolio)
+
+            # Mid-day rebuild: at the configured hours (12:00 ET, 14:00 ET) do
+            # a fresh build so setups that only formed during the session get
+            # picked up. Once per hour, dedup'd via rebuilt_hours_today.
+            now_et = now.astimezone(ET)
+            for hr in MIDDAY_REBUILD_HOURS:
+                if now_et.hour == hr and hr not in rebuilt_hours_today:
+                    watchlist = _force_rebuild_watchlist(portfolio)
+                    rebuilt_hours_today.add(hr)
+                    break
+
             sent = check_once(watchlist)
             if sent == 0:
-                print(f"[tick] {datetime.now(ET).strftime('%H:%M:%S ET')} — no crosses")
+                print(f"[tick] {now_et.strftime('%H:%M:%S ET')} — no crosses")
             time.sleep(POLL_SEC)
         except KeyboardInterrupt:
             print("[stop] interrupted")
