@@ -63,11 +63,16 @@ ALERTS_STATE_PATH = Path(os.environ.get("ALERTS_STATE_PATH", _DATA_DIR / "intrad
 
 PORTFOLIO_FILE = Path("portfolio.txt")
 
+# Bump when the watchlist schema changes so cached files get regenerated
+# on deploy instead of sticking around until the next trading day.
+WATCHLIST_SCHEMA_VERSION = 2
+
 # Session timing (US market, ET)
 MARKET_OPEN  = dtime(9, 30)
 MARKET_CLOSE = dtime(16, 0)
 OPENING_SKIP_MIN = 10        # ignore first 10 min after open (fakeout window)
 ATR_CONFIRMATION = 0.10      # bar close must clear level by >= this many ATRs
+ATR_FOLLOW_THROUGH = 0.50    # for already-triggered setups, require a stronger continuation
 
 
 # ─────────────────────────────────────────────────────────────
@@ -82,13 +87,26 @@ class WatchSetup:
     label: str
     quality_label: str
     atr: float             # daily ATR — used as the wick-fakeout buffer
+    # When True, this is a follow-through alert on a level that already
+    # triggered today. Watcher uses a 0.5-ATR confirmation buffer for these
+    # so we only ping on real continuation, not noise around the breakout.
+    is_follow_through: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, d: dict) -> "WatchSetup":
-        return cls(**d)
+        # Tolerate older watchlists missing the follow-through field
+        return cls(
+            kind=d["kind"],
+            direction=d["direction"],
+            trigger=d["trigger"],
+            label=d["label"],
+            quality_label=d["quality_label"],
+            atr=d["atr"],
+            is_follow_through=bool(d.get("is_follow_through", False)),
+        )
 
 
 # ─────────────────────────────────────────────────────────────
@@ -139,10 +157,11 @@ def build_watchlist(tickers: list[str]) -> dict[str, list[WatchSetup]]:
             continue
         atr = _atr_from_result(r.result)
         candidates: list[WatchSetup] = []
+
+        # Pending STRONG setups within 5% — watcher pings on first cross
         for s in list(r.result.get("breakouts") or []) + list(r.result.get("breakdowns") or []):
             if s.quality_label != "STRONG":
                 continue
-            # Skip levels too far away to plausibly fire today (> 5%)
             if abs(s.distance_pct) > 5.0:
                 continue
             candidates.append(WatchSetup(
@@ -152,7 +171,27 @@ def build_watchlist(tickers: list[str]) -> dict[str, list[WatchSetup]]:
                 label=s.label,
                 quality_label=s.quality_label,
                 atr=atr,
+                is_follow_through=False,
             ))
+
+        # Recently-triggered STRONG setups — watcher pings on follow-through
+        # (close >= trigger + 0.5 ATR for breakouts, symmetric for breakdowns)
+        # so we capture continuation moves the strict-pending watcher misses.
+        for s in list(r.result.get("triggered") or []):
+            if s.quality_label != "STRONG":
+                continue
+            if (s.bars_since_trigger or 0) > 5:
+                continue
+            candidates.append(WatchSetup(
+                kind=s.kind,
+                direction=s.direction,
+                trigger=float(s.trigger_price),
+                label=s.label,
+                quality_label=s.quality_label,
+                atr=atr,
+                is_follow_through=True,
+            ))
+
         if not candidates:
             continue
         # Closest-to-price first; cap to limit
@@ -169,6 +208,7 @@ def build_watchlist(tickers: list[str]) -> dict[str, list[WatchSetup]]:
 
 def save_watchlist(watchlist: dict[str, list[WatchSetup]]) -> None:
     payload = {
+        "schema_version": WATCHLIST_SCHEMA_VERSION,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "tickers": {tk: [w.to_dict() for w in ws] for tk, ws in watchlist.items()},
     }
@@ -182,6 +222,10 @@ def load_watchlist() -> tuple[dict[str, list[WatchSetup]], str | None]:
     try:
         data = json.loads(WATCHLIST_PATH.read_text())
     except json.JSONDecodeError:
+        return {}, None
+    # Force regenerate if the schema version doesn't match (the in-disk
+    # format may be missing new fields the watcher now depends on)
+    if data.get("schema_version") != WATCHLIST_SCHEMA_VERSION:
         return {}, None
     out: dict[str, list[WatchSetup]] = {}
     for tk, ws in (data.get("tickers") or {}).items():
@@ -220,8 +264,10 @@ def save_state(state: dict) -> None:
 
 
 def alert_key(ticker: str, setup: WatchSetup, date_str: str) -> str:
-    # Round trigger to 2dp so float jitter doesn't break dedup
-    return f"{ticker}|{setup.kind}|{setup.trigger:.2f}|{date_str}"
+    # Round trigger to 2dp so float jitter doesn't break dedup. The FT marker
+    # keeps follow-through alerts dedup-separate from initial-cross alerts.
+    ft = "FT" if setup.is_follow_through else "X"
+    return f"{ticker}|{setup.kind}|{ft}|{setup.trigger:.2f}|{date_str}"
 
 
 # ─────────────────────────────────────────────────────────────
@@ -288,13 +334,18 @@ def _send_telegram(text: str) -> None:
 
 def format_alert(ticker: str, setup: WatchSetup, bar: dict) -> str:
     arrow = "▲" if setup.direction == "BREAKOUT" else "▼"
-    side = "BREAKOUT" if setup.direction == "BREAKOUT" else "BREAKDOWN"
+    if setup.is_follow_through:
+        side = "FOLLOW-THROUGH" + ("" if setup.direction == "BREAKOUT" else " ↓")
+        body_verb = "Extending past"
+    else:
+        side = "BREAKOUT" if setup.direction == "BREAKOUT" else "BREAKDOWN"
+        body_verb = "Cleared"
     chg_from_trigger = (bar["close"] - setup.trigger) / setup.trigger * 100
     bar_time_et = bar["ts"].astimezone(ET).strftime("%H:%M ET")
     lines = [
         f"<b>{arrow} INTRADAY {side} — {ticker}</b>",
         f"<code>${bar['close']:.2f}</code>  ({chg_from_trigger:+.2f}% vs trigger)",
-        f"Cleared <b>{setup.label.upper()}</b> @ <code>${setup.trigger:.2f}</code>",
+        f"{body_verb} <b>{setup.label.upper()}</b> @ <code>${setup.trigger:.2f}</code>",
         f"<i>5-min bar close · {bar_time_et}</i>",
     ]
     return "\n".join(lines)
@@ -305,12 +356,21 @@ def format_alert(ticker: str, setup: WatchSetup, bar: dict) -> str:
 # ─────────────────────────────────────────────────────────────
 
 def is_cross(bar: dict, setup: WatchSetup) -> bool:
-    """Return True if the bar represents a fresh, confirmed cross of the level.
-    For breakouts: close >= trigger + 0.1 ATR AND bar high crossed the level.
-    For breakdowns: symmetric below."""
-    buffer = max(setup.atr * ATR_CONFIRMATION, setup.trigger * 0.0005)  # min 5 bps
+    """Return True if the bar represents a confirmed cross of the level.
+    For pending setups: bar close must clear by >= 0.1 ATR and the bar must
+    have touched the trigger (rules out gap-throughs that retraced).
+    For follow-through setups (level already triggered today): bar close
+    must extend >= 0.5 ATR past the level — captures real continuation
+    rather than chop around the breakout level."""
+    atr_mult = ATR_FOLLOW_THROUGH if setup.is_follow_through else ATR_CONFIRMATION
+    buffer = max(setup.atr * atr_mult, setup.trigger * 0.0005)
     if setup.direction == "BREAKOUT":
+        if setup.is_follow_through:
+            return bar["close"] >= setup.trigger + buffer
         return bar["close"] >= setup.trigger + buffer and bar["high"] >= setup.trigger
+    # BREAKDOWN
+    if setup.is_follow_through:
+        return bar["close"] <= setup.trigger - buffer
     return bar["close"] <= setup.trigger - buffer and bar["low"] <= setup.trigger
 
 
