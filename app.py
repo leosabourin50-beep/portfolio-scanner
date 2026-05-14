@@ -304,6 +304,57 @@ hr { border: none; height: 1px; background: var(--border); margin: 1.5rem 0 !imp
 .port-tier { color: var(--text-2); font-size: 0.66rem; letter-spacing: 0.12em; }
 .port-level { color: var(--text-1); text-align: right; }
 
+/* ── Clickable portfolio rows (Streamlit columns layout) ────────── */
+.port-grid-row .stButton { margin: 0 !important; }
+.port-grid-row .stButton button {
+    width: 100%;
+    background: transparent !important;
+    border: 1px solid transparent !important;
+    border-bottom: 1px solid var(--border) !important;
+    border-radius: 0 !important;
+    color: var(--text-0) !important;
+    font-family: var(--mono) !important;
+    font-size: 0.82rem !important;
+    font-weight: 600 !important;
+    letter-spacing: 0.06em !important;
+    text-align: left !important;
+    justify-content: flex-start !important;
+    padding: 8px 10px !important;
+    height: 36px !important;
+    text-transform: none !important;
+}
+.port-grid-row .stButton button:hover {
+    background: rgba(255, 176, 0, 0.06) !important;
+    border-color: var(--amber) !important;
+    color: var(--amber) !important;
+}
+.port-grid-row .stButton button:focus {
+    box-shadow: none !important;
+    outline: none !important;
+}
+.port-grid-row [data-testid="stMarkdownContainer"] p {
+    margin: 0 !important;
+    padding: 9px 8px !important;
+    font-family: var(--mono) !important;
+    font-size: 0.78rem !important;
+    border-bottom: 1px solid var(--border) !important;
+    line-height: 18px !important;
+}
+.port-grid-header [data-testid="stMarkdownContainer"] p {
+    margin: 0 !important;
+    padding: 10px 8px !important;
+    font-family: var(--mono) !important;
+    font-size: 0.62rem !important;
+    letter-spacing: 0.16em !important;
+    text-transform: uppercase !important;
+    color: var(--text-2) !important;
+    background: var(--bg-2);
+    border-bottom: 1px solid var(--border-strong) !important;
+}
+.cell-chg-pos { color: var(--phosphor); }
+.cell-chg-neg { color: var(--warning); }
+.cell-right   { text-align: right; }
+
 /* ── Live pill ───────────────────────────────────────────────── */
 .live-pill {
     display: inline-block;
@@ -415,24 +466,47 @@ def _render_top_moves(reads: list[ps.ActionableRead]) -> None:
     st.markdown(f"<div class='move-grid'>{cards}</div>", unsafe_allow_html=True)
 
 
+_PORT_COL_WIDTHS = [1.0, 1.0, 0.9, 3.0, 1.4, 1.1]
+_PORT_HEADERS = ["Ticker", "Price", "Chg", "Headline", "Tier", "Level"]
+
+
 def _render_portfolio_table(reads: list[ps.ActionableRead]) -> None:
-    rows = ["<div class='port-row port-header'>"
-            "<div>Ticker</div><div>Price</div><div>Chg</div>"
-            "<div>Headline</div><div>Tier</div><div>Level</div>"
-            "</div>"]
+    """Render the full portfolio as a clickable grid. The Ticker cell is a
+    Streamlit button per row — clicking it sets `drill_ticker` in session
+    state and reruns, which populates the drill-down section below."""
+    # Header row
+    st.markdown("<div class='port-grid-header'>", unsafe_allow_html=True)
+    hcols = st.columns(_PORT_COL_WIDTHS)
+    for c, label in zip(hcols, _PORT_HEADERS):
+        c.markdown(label)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # Data rows — ticker is a real button so the click sets session state
     for r in reads:
-        chg_cls = "port-chg-pos" if r.chg_pct >= 0 else "port-chg-neg"
-        rows.append(
-            f"<div class='port-row'>"
-            f"<div class='port-tick'>{r.ticker}</div>"
-            f"<div class='port-price'>${r.last_price:.2f}</div>"
-            f"<div class='{chg_cls}'>{r.chg_pct:+.2f}%</div>"
-            f"<div class='port-head' style='color:{r.color};'>{r.icon} {html_mod.escape(r.headline_title)}</div>"
-            f"<div class='port-tier'>{html_mod.escape(r.tier_label)}</div>"
-            f"<div class='port-level'>{html_mod.escape(r.headline_level or '')}</div>"
-            f"</div>"
+        st.markdown("<div class='port-grid-row'>", unsafe_allow_html=True)
+        cols = st.columns(_PORT_COL_WIDTHS)
+        with cols[0]:
+            if st.button(r.ticker, key=f"row_btn_{r.ticker}", use_container_width=True):
+                st.session_state.drill_ticker = r.ticker
+                st.rerun()
+        chg_cls = "cell-chg-pos" if r.chg_pct >= 0 else "cell-chg-neg"
+        cols[1].markdown(f"${r.last_price:.2f}")
+        cols[2].markdown(f"<span class='{chg_cls}'>{r.chg_pct:+.2f}%</span>", unsafe_allow_html=True)
+        cols[3].markdown(
+            f"<span style='color:{r.color};'>{r.icon} {html_mod.escape(r.headline_title)}</span>",
+            unsafe_allow_html=True,
         )
-    st.markdown("".join(rows), unsafe_allow_html=True)
+        cols[4].markdown(
+            f"<span style='color:var(--text-2); font-size:0.7rem; letter-spacing:0.12em;'>"
+            f"{html_mod.escape(r.tier_label)}</span>",
+            unsafe_allow_html=True,
+        )
+        cols[5].markdown(
+            f"<span class='cell-right' style='color:var(--text-1); display:block;'>"
+            f"{html_mod.escape(r.headline_level or '')}</span>",
+            unsafe_allow_html=True,
+        )
+        st.markdown("</div>", unsafe_allow_html=True)
 
 
 # ─────────────────────────────────────────────────
@@ -1047,23 +1121,31 @@ def main() -> None:
     _section_label("PORTFOLIO · ALL NAMES", accent=AMBER)
     _render_portfolio_table(reads)
 
-    # Drill-down picker
+    # Drill-down (set by clicking a ticker in the portfolio table above)
     st.markdown("&nbsp;", unsafe_allow_html=True)
-    _section_label("DRILL-DOWN · SELECT A TICKER", accent=CYAN)
-    ticker_options = [r.ticker for r in reads]
-    selected = st.selectbox(
-        "Drill into a ticker for charts + narrative",
-        options=["—"] + ticker_options,
-        index=0,
-        label_visibility="collapsed",
-    )
-    if selected and selected != "—":
-        st.session_state.drill_ticker = selected
-        read = next((r for r in reads if r.ticker == selected), None)
-        if read is not None and not read.result.get("error"):
-            _render_drilldown(read, cfg)
-        elif read is not None:
-            st.error(f"{selected} — analysis error: {read.result.get('error')}")
+    drill_ticker = st.session_state.get("drill_ticker")
+    if drill_ticker:
+        read = next((r for r in reads if r.ticker == drill_ticker), None)
+        if read is None:
+            st.session_state.drill_ticker = None
+        else:
+            head_col, btn_col = st.columns([5, 1])
+            with btn_col:
+                if st.button("CLEAR", key="clear_drill", use_container_width=True):
+                    st.session_state.drill_ticker = None
+                    st.rerun()
+            if read.result.get("error"):
+                st.error(f"{drill_ticker} — analysis error: {read.result.get('error')}")
+            else:
+                _render_drilldown(read, cfg)
+    else:
+        _section_label("DRILL-DOWN", accent=CYAN)
+        st.markdown(
+            "<div style='font-family:var(--mono); color:var(--text-2); font-size:0.78rem; "
+            "padding:0.5rem 0;'>Click any ticker in the portfolio table above to load "
+            "the full daily + weekly chart and narrative.</div>",
+            unsafe_allow_html=True,
+        )
 
 
 if __name__ == "__main__":
