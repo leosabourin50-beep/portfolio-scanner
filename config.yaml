@@ -1,0 +1,59 @@
+# Single-Name Analyzer Configuration
+
+# Data pull settings
+data:
+  daily_bars_days: 730         # ~2 calendar years (≈500 trading bars)
+  intraday_bars_days: 20       # calendar days of 15-min bars
+  intraday_multiplier: 15      # bar size in minutes
+  benchmark: "SPY"
+
+# Detector params (passed to detector.analyze — same shape as broad screener)
+params:
+  lookback_days: 500
+  donchian_period: 50
+  atr_short: 10
+  atr_long: 50
+  bb_period: 20
+  bb_std: 2
+  pct_window: 252
+  atr_pct_max: 25
+  bbw_pct_max: 25
+  range_window: 10
+  volume_avg_period: 50
+  volume_breakout_mult: 1.5
+  strong_vol_mult: 2.0
+  strong_close_loc: 0.75
+  moderate_vol_mult: 1.3
+  moderate_close_loc: 0.65
+  magnitude_pct: 6.0
+  magnitude_close_loc: 0.85
+
+# Additional indicators (computed by single_name_analyzer on top of detector)
+indicators:
+  rsi_period: 14
+  macd_fast: 12
+  macd_slow: 26
+  macd_signal: 9
+  ma_periods: [20, 50, 200]
+  donchian_periods: [20, 50, 252]
+
+# Chart display
+chart:
+  daily_show_days: 504         # ~2 years on the daily chart (catches mid-term bases)
+  weekly_show_weeks: 104       # ~2 years on the weekly chart
+  intraday_show_days: 5        # 5 trading days on intraday chart
+  auto_log_scale: true         # auto-flip to log when visible price range is wide
+  log_scale_threshold_pct: 50  # if (high-low)/low > this pct over the view, use log
+  ma_colors:
+    ma_20: "#3b82f6"           # blue
+    ma_50: "#f97316"           # orange
+    ma_200: "#ef4444"          # red
+  consolidation_fill: "rgba(59, 130, 246, 0.1)"
+  vwap_color: "#a855f7"        # purple
+
+# Grade thresholds
+grading:
+  excellent_min: 80
+  good_min: 60
+  wait_min: 35
+  # below wait_min = AVOID
