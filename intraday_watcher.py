@@ -74,6 +74,13 @@ OPENING_SKIP_MIN = 10        # ignore first 10 min after open (fakeout window)
 ATR_CONFIRMATION = 0.10      # bar close must clear level by >= this many ATRs
 ATR_FOLLOW_THROUGH = 0.50    # for already-triggered setups, require a stronger continuation
 
+# Setups that get the special "🏆 NEW 52-WEEK HIGH" / "📉 NEW 52-WEEK LOW"
+# treatment — wick-based detection (any bar.high above the level fires) with
+# distinct alert formatting. These bypass the close-based confirmation buffer
+# because the moment a 52w high prints is the moment that matters.
+_52W_HIGH_KINDS = {"DONCHIAN_252_HIGH", "WEEKLY_52W_HIGH"}
+_52W_LOW_KINDS  = {"DONCHIAN_252_LOW", "WEEKLY_52W_LOW"}
+
 
 # ─────────────────────────────────────────────────────────────
 # Watchlist data model
@@ -333,6 +340,26 @@ def _send_telegram(text: str) -> None:
 
 
 def format_alert(ticker: str, setup: WatchSetup, bar: dict) -> str:
+    bar_time_et = bar["ts"].astimezone(ET).strftime("%H:%M ET")
+
+    # Special-case 52-week high / low — distinct trophy/down-trend formatting
+    if setup.kind in _52W_HIGH_KINDS:
+        chg = (bar["high"] - setup.trigger) / setup.trigger * 100
+        return "\n".join([
+            f"<b>🏆 NEW 52-WEEK HIGH — {ticker}</b>",
+            f"<code>${bar['high']:.2f}</code>  ({chg:+.2f}% past prior 52wh)",
+            f"Prior high <code>${setup.trigger:.2f}</code>",
+            f"<i>{bar_time_et}</i>",
+        ])
+    if setup.kind in _52W_LOW_KINDS:
+        chg = (bar["low"] - setup.trigger) / setup.trigger * 100
+        return "\n".join([
+            f"<b>📉 NEW 52-WEEK LOW — {ticker}</b>",
+            f"<code>${bar['low']:.2f}</code>  ({chg:+.2f}% past prior 52wl)",
+            f"Prior low <code>${setup.trigger:.2f}</code>",
+            f"<i>{bar_time_et}</i>",
+        ])
+
     arrow = "▲" if setup.direction == "BREAKOUT" else "▼"
     if setup.is_follow_through:
         side = "FOLLOW-THROUGH" + ("" if setup.direction == "BREAKOUT" else " ↓")
@@ -341,7 +368,6 @@ def format_alert(ticker: str, setup: WatchSetup, bar: dict) -> str:
         side = "BREAKOUT" if setup.direction == "BREAKOUT" else "BREAKDOWN"
         body_verb = "Cleared"
     chg_from_trigger = (bar["close"] - setup.trigger) / setup.trigger * 100
-    bar_time_et = bar["ts"].astimezone(ET).strftime("%H:%M ET")
     lines = [
         f"<b>{arrow} INTRADAY {side} — {ticker}</b>",
         f"<code>${bar['close']:.2f}</code>  ({chg_from_trigger:+.2f}% vs trigger)",
@@ -357,11 +383,19 @@ def format_alert(ticker: str, setup: WatchSetup, bar: dict) -> str:
 
 def is_cross(bar: dict, setup: WatchSetup) -> bool:
     """Return True if the bar represents a confirmed cross of the level.
-    For pending setups: bar close must clear by >= 0.1 ATR and the bar must
-    have touched the trigger (rules out gap-throughs that retraced).
-    For follow-through setups (level already triggered today): bar close
-    must extend >= 0.5 ATR past the level — captures real continuation
-    rather than chop around the breakout level."""
+    52-week high/low setups fire wick-based on any bar high/low printing past
+    the level — the moment a new 52wh prints is the moment that matters.
+    Pending setups: bar close must clear by >= 0.1 ATR and the bar must have
+    touched the trigger (rules out gap-throughs that retraced).
+    Follow-through setups (level already triggered today): bar close must
+    extend >= 0.5 ATR past the level — captures real continuation rather
+    than chop around the breakout level."""
+    # 52-week high/low: pure wick check, no buffer
+    if setup.kind in _52W_HIGH_KINDS:
+        return bar["high"] > setup.trigger
+    if setup.kind in _52W_LOW_KINDS:
+        return bar["low"] < setup.trigger
+
     atr_mult = ATR_FOLLOW_THROUGH if setup.is_follow_through else ATR_CONFIRMATION
     buffer = max(setup.atr * atr_mult, setup.trigger * 0.0005)
     if setup.direction == "BREAKOUT":
