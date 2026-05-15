@@ -514,6 +514,10 @@ _BEARISH_PATTERNS = {
 # pattern's geometric breakout_level is no longer current resistance.
 PATTERN_STALE_DAILY_DAYS = 14
 PATTERN_STALE_WEEKLY_DAYS = 28
+# A "Confirmed" pattern is normally history, but one that confirmed within
+# the last few bars (clean cross of the breakout level) is highly actionable
+# — surface it as a triggered "… CONFIRMED" instead of dropping it.
+CONFIRMED_FRESH_BARS = 5
 
 
 def find_pattern_setups(pattern_results, df: pd.DataFrame, atr: float) -> list[Setup]:
@@ -534,8 +538,7 @@ def find_pattern_setups(pattern_results, df: pd.DataFrame, atr: float) -> list[S
     last_date = df.index[-1]
     setups: list[Setup] = []
     for p in pattern_results or []:
-        if p.status == "Confirmed":
-            continue
+        is_confirmed = (p.status == "Confirmed")
         weekly = "[weekly]" in (p.notes or "")
         timeframe = "weekly" if weekly else "daily"
         threshold = PATTERN_STALE_WEEKLY_DAYS if weekly else PATTERN_STALE_DAILY_DAYS
@@ -552,13 +555,39 @@ def find_pattern_setups(pattern_results, df: pd.DataFrame, atr: float) -> list[S
         d_pct, d_atr = _distances(trigger, last, atr)
         if abs(d_pct) > MAX_DISTANCE_PCT:
             continue
-        # Skip patterns whose trigger has already been cleared meaningfully
-        # in our direction. The "Breaking out" route below catches the
-        # narrow band right around the trigger.
-        if direction == "BREAKOUT" and trigger < last * 0.99:
-            continue
-        if direction == "BREAKDOWN" and trigger > last * 1.01:
-            continue
+
+        if is_confirmed:
+            # Recently-confirmed patterns are highly actionable (e.g. a
+            # Cup & Handle that just broke its neckline). Surface as a
+            # triggered "… CONFIRMED" if the breakout cross is within the
+            # recent window; otherwise it's genuinely history — drop it.
+            # The "already cleared" guard below is intentionally skipped:
+            # a confirmed pattern is *supposed* to have cleared.
+            bst = _bars_since_level_cross(
+                df, trigger, direction, max_lookback=CONFIRMED_FRESH_BARS
+            )
+            if bst is None:
+                continue
+            bars_since_trigger = bst
+        else:
+            # Skip patterns whose trigger has already been cleared
+            # meaningfully in our direction. The "Breaking out" route
+            # below catches the narrow band right around the trigger.
+            if direction == "BREAKOUT" and trigger < last * 0.99:
+                continue
+            if direction == "BREAKDOWN" and trigger > last * 1.01:
+                continue
+            if p.status == "Breaking out":
+                # Pin to the ACTUAL cross bar instead of hardcoding 0. A
+                # pattern can stay "Breaking out" (price within 1% of the
+                # trigger) for many sessions; without this it re-stamps as
+                # a fresh same-day breakout every scan.
+                bst = _bars_since_level_cross(df, trigger, direction, max_lookback=60)
+                if bst is None:
+                    bst = max(age_days, 6)
+                bars_since_trigger = bst
+            else:
+                bars_since_trigger = None
 
         eff_conf = float(p.confidence)
         if weekly:
@@ -573,28 +602,17 @@ def find_pattern_setups(pattern_results, df: pd.DataFrame, atr: float) -> list[S
         if p.notes and "rescored" in p.notes:
             rationale.append("distant pattern — early-forming")
 
-        if p.status == "Breaking out":
-            # Pin to the ACTUAL cross bar instead of hardcoding 0. A pattern
-            # can stay "Breaking out" (price within 1% of the trigger) for
-            # many sessions; without this it re-stamps as a fresh same-day
-            # breakout every scan and monopolises the headline.
-            bst = _bars_since_level_cross(df, trigger, direction, max_lookback=60)
-            if bst is None:
-                # No clean close transition in 60 bars — price has held
-                # beyond the trigger for a long time. Treat as a stale
-                # trigger (use pattern age, floored above the fresh/recent
-                # window) so it never shows as FRESH BREAKOUT today.
-                bst = max(age_days, 6)
-            bars_since_trigger = bst
-        else:
-            bars_since_trigger = None
-
         setups.append(Setup(
             direction=direction,
             kind=f"PATTERN_{'BEAR' if is_bear else 'BULL'}_{p.pattern.replace(' ', '_').upper()}",
-            label=f"{'Weekly ' if weekly else ''}{p.pattern}",
+            label=(
+                f"{'Weekly ' if weekly else ''}{p.pattern}"
+                + (" (confirmed)" if is_confirmed else "")
+            ),
             trigger_price=round(trigger, 2),
             trigger_condition=(
+                f"{p.pattern} CONFIRMED — cleared ${trigger:.2f}, watch it hold"
+                if is_confirmed else
                 f"{'Close above' if direction == 'BREAKOUT' else 'Close below'} "
                 f"${trigger:.2f} ({p.pattern} trigger)"
                 if bars_since_trigger is None else
@@ -2103,8 +2121,27 @@ def merge_confluence(setups: list[Setup], atr: float) -> list[Setup]:
             if len(cluster) == 1:
                 merged.append(cluster[0])
                 continue
-            anchor = max(cluster, key=lambda s: _base_quality_for_kind(s.kind))
+            # A named chart pattern (Cup & Handle, H&S, etc.) is far more
+            # informative to a discretionary trader than the generic level
+            # it happens to coincide with ("horizontal support"). So if the
+            # cluster contains any pattern, the strongest pattern anchors
+            # the merge and keeps its label — the generic levels are still
+            # preserved in confluence_with / rationale.
+            pattern_members = [s for s in cluster if s.kind.startswith("PATTERN_")]
+            if pattern_members:
+                anchor = max(pattern_members, key=lambda s: _base_quality_for_kind(s.kind))
+            else:
+                anchor = max(cluster, key=lambda s: _base_quality_for_kind(s.kind))
             others = [s for s in cluster if s is not anchor]
+            # Don't lose diagonal geometry: if the pattern anchor has no
+            # line_meta but an absorbed channel/trendline does, carry it so
+            # the rail still renders on the chart (now under the pattern's
+            # label).
+            if not anchor.line_meta:
+                for o in others:
+                    if o.line_meta:
+                        anchor.line_meta = o.line_meta
+                        break
             anchor.confluence_with = [s.kind for s in others]
             extra = ", ".join(s.label for s in others)
             anchor.rationale.append(f"Confluence: {extra}")
