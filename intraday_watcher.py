@@ -65,7 +65,7 @@ PORTFOLIO_FILE = Path("portfolio.txt")
 
 # Bump when the watchlist schema changes so cached files get regenerated
 # on deploy instead of sticking around until the next trading day.
-WATCHLIST_SCHEMA_VERSION = 3
+WATCHLIST_SCHEMA_VERSION = 4
 
 # Session timing (US market, ET)
 MARKET_OPEN  = dtime(9, 30)
@@ -126,6 +126,9 @@ class WatchSetup:
     # level — fires the moment price tags the level (decision point: bounce
     # or break) rather than waiting for a confirming close.
     is_touch: bool = False
+    # 20-day average daily volume for this ticker — used to annotate alerts
+    # with relative volume so a move's participation is visible at a glance.
+    avg_daily_vol: float = 0.0
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -142,6 +145,7 @@ class WatchSetup:
             atr=d["atr"],
             is_follow_through=bool(d.get("is_follow_through", False)),
             is_touch=bool(d.get("is_touch", False)),
+            avg_daily_vol=float(d.get("avg_daily_vol", 0.0)),
         )
 
 
@@ -305,7 +309,18 @@ def build_watchlist(tickers: list[str]) -> dict[str, list[WatchSetup]]:
                     is_follow_through=False,
                     is_touch=True,
                 ))
-        watchlist[r.ticker] = candidates + twins
+        final = candidates + twins
+
+        # Stamp 20-day average daily volume on every entry (excludes today's
+        # live/partial bar) so alerts can show relative volume.
+        avg_dv = 0.0
+        ddf = r.result.get("df_daily")
+        if ddf is not None and not ddf.empty and len(ddf) > 21:
+            avg_dv = float(ddf["Volume"].iloc[-21:-1].mean() or 0.0)
+        for w in final:
+            w.avg_daily_vol = avg_dv
+
+        watchlist[r.ticker] = final
 
     return watchlist
 
@@ -415,6 +430,47 @@ def fetch_latest_5m_bar(ticker: str) -> dict | None:
     }
 
 
+def _volume_context(ticker: str, avg_daily_vol: float, bar: dict) -> str | None:
+    """Relative-volume annotation for an alert. Returns a short string like
+    'Vol 2.4× normal pace · this bar 3.1× avg 5m', or None if unavailable.
+
+    Session RVOL = (cumulative volume so far today) / (avg daily volume ×
+    fraction of the 9:30–16:00 session elapsed at the firing bar). >1 means
+    today is trading heavier than normal — real participation behind the
+    move. The per-bar multiple shows whether the firing bar itself was a
+    volume surge vs a typical 5-min bar (avg_daily_vol / 78 bars)."""
+    if not avg_daily_vol or avg_daily_vol <= 0:
+        return None
+    client = get_client()
+    today = datetime.now(ET).date().strftime("%Y-%m-%d")
+    try:
+        bars = list(client.get_aggs(
+            ticker=ticker, multiplier=5, timespan="minute",
+            from_=today, to=today, adjusted=True, sort="asc", limit=120,
+        ))
+    except Exception:
+        return None
+    if not bars:
+        return None
+    cum_vol = sum(float(b.volume or 0) for b in bars)
+
+    bar_et = bar["ts"].astimezone(ET)
+    session_start = bar_et.replace(hour=9, minute=30, second=0, microsecond=0)
+    session_len = 6.5 * 3600.0
+    elapsed = max((bar_et - session_start).total_seconds(), 60.0)
+    frac = min(max(elapsed / session_len, 0.02), 1.0)
+
+    expected = avg_daily_vol * frac
+    if expected <= 0:
+        return None
+    rvol = cum_vol / expected
+    avg_5m = avg_daily_vol / 78.0
+    bar_mult = (bar["volume"] / avg_5m) if avg_5m > 0 else 0.0
+    if rvol <= 0:
+        return None
+    return f"📊 Vol {rvol:.1f}× normal pace · this bar {bar_mult:.1f}× avg 5m"
+
+
 # ─────────────────────────────────────────────────────────────
 # Telegram delivery
 # ─────────────────────────────────────────────────────────────
@@ -451,64 +507,67 @@ def _send_telegram(text: str) -> bool:
         return False
 
 
-def format_alert(ticker: str, setup: WatchSetup, bar: dict) -> str:
+def format_alert(ticker: str, setup: WatchSetup, bar: dict,
+                  vol_note: str | None = None) -> str:
     bar_time_et = bar["ts"].astimezone(ET).strftime("%H:%M ET")
 
     # Special-case 52-week high / low — distinct trophy/down-trend formatting
     if setup.kind in _52W_HIGH_KINDS:
         chg = (bar["high"] - setup.trigger) / setup.trigger * 100
-        return "\n".join([
+        lines = [
             f"<b>🏆 NEW 52-WEEK HIGH — {ticker}</b>",
             f"<code>${bar['high']:.2f}</code>  ({chg:+.2f}% past prior 52wh)",
             f"Prior high <code>${setup.trigger:.2f}</code>",
-            f"<i>{bar_time_et}</i>",
-        ])
-    if setup.kind in _52W_LOW_KINDS:
+        ]
+        footer = bar_time_et
+    elif setup.kind in _52W_LOW_KINDS:
         chg = (bar["low"] - setup.trigger) / setup.trigger * 100
-        return "\n".join([
+        lines = [
             f"<b>📉 NEW 52-WEEK LOW — {ticker}</b>",
             f"<code>${bar['low']:.2f}</code>  ({chg:+.2f}% past prior 52wl)",
             f"Prior low <code>${setup.trigger:.2f}</code>",
-            f"<i>{bar_time_et}</i>",
-        ])
-
-    # Horizontal S/R or MA level touch — decision-point ping
-    if setup.is_touch:
+        ]
+        footer = bar_time_et
+    elif setup.is_touch:
+        # Horizontal S/R or MA level touch — decision-point ping
         held = "resistance" if setup.direction == "BREAKOUT" else "support"
-        return "\n".join([
+        lines = [
             f"<b>📍 LEVEL TOUCH — {ticker}</b>",
             f"Tagged {held} <b>{setup.label.upper()}</b> @ <code>${setup.trigger:.2f}</code>",
             f"Now <code>${bar['close']:.2f}</code>",
-            f"<i>watch for bounce or break · {bar_time_et}</i>",
-        ])
-
-    # Channel rail touch — distinct from a breakout ping
-    if _is_channel_kind(setup.kind):
+        ]
+        footer = f"watch for bounce or break · {bar_time_et}"
+    elif _is_channel_kind(setup.kind):
+        # Channel rail touch — distinct from a breakout ping
         rail_side = "UPPER" if "UPPER" in setup.kind else ("LOWER" if "LOWER" in setup.kind else "RAIL")
         tf = "WEEKLY" if "WEEKLY" in setup.kind else "DAILY"
         slope = "ASCENDING" if "ASCENDING" in setup.kind else (
                 "DESCENDING" if "DESCENDING" in setup.kind else "CHANNEL")
-        return "\n".join([
+        lines = [
             f"<b>📍 CHANNEL TOUCH — {ticker}</b>",
             f"{tf} {slope} channel — {rail_side.lower()} rail @ <code>${setup.trigger:.2f}</code>",
             f"Now <code>${bar['close']:.2f}</code>",
-            f"<i>watch for bounce or break · {bar_time_et}</i>",
-        ])
-
-    arrow = "▲" if setup.direction == "BREAKOUT" else "▼"
-    if setup.is_follow_through:
-        side = "FOLLOW-THROUGH" + ("" if setup.direction == "BREAKOUT" else " ↓")
-        body_verb = "Extending past"
+        ]
+        footer = f"watch for bounce or break · {bar_time_et}"
     else:
-        side = "BREAKOUT" if setup.direction == "BREAKOUT" else "BREAKDOWN"
-        body_verb = "Cleared"
-    chg_from_trigger = (bar["close"] - setup.trigger) / setup.trigger * 100
-    lines = [
-        f"<b>{arrow} INTRADAY {side} — {ticker}</b>",
-        f"<code>${bar['close']:.2f}</code>  ({chg_from_trigger:+.2f}% vs trigger)",
-        f"{body_verb} <b>{setup.label.upper()}</b> @ <code>${setup.trigger:.2f}</code>",
-        f"<i>5-min bar close · {bar_time_et}</i>",
-    ]
+        arrow = "▲" if setup.direction == "BREAKOUT" else "▼"
+        if setup.is_follow_through:
+            side = "FOLLOW-THROUGH" + ("" if setup.direction == "BREAKOUT" else " ↓")
+            body_verb = "Extending past"
+        else:
+            side = "BREAKOUT" if setup.direction == "BREAKOUT" else "BREAKDOWN"
+            body_verb = "Cleared"
+        chg_from_trigger = (bar["close"] - setup.trigger) / setup.trigger * 100
+        lines = [
+            f"<b>{arrow} INTRADAY {side} — {ticker}</b>",
+            f"<code>${bar['close']:.2f}</code>  ({chg_from_trigger:+.2f}% vs trigger)",
+            f"{body_verb} <b>{setup.label.upper()}</b> @ <code>${setup.trigger:.2f}</code>",
+        ]
+        footer = f"5-min bar close · {bar_time_et}"
+
+    if vol_note:
+        lines.append(vol_note)
+    lines.append(f"<i>{footer}</i>")
     return "\n".join(lines)
 
 
@@ -609,7 +668,8 @@ def check_once(watchlist: dict[str, list[WatchSetup]]) -> int:
             if key in already:
                 continue
             if is_cross(bar, s):
-                if _send_telegram(format_alert(ticker, s, bar)):
+                vol_note = _volume_context(ticker, s.avg_daily_vol, bar)
+                if _send_telegram(format_alert(ticker, s, bar, vol_note)):
                     already.add(key)
                     sent += 1
                     print(f"[alert] {ticker} {s.direction} {s.kind} @ ${s.trigger:.2f}")
