@@ -239,6 +239,38 @@ def _find_recent_cross_below(
     return None, None
 
 
+def _bars_since_level_cross(
+    df: pd.DataFrame, level: float, direction: str, max_lookback: int = 60,
+) -> Optional[int]:
+    """Bars since Close FIRST crossed `level` in `direction` (the transition
+    bar where prev was on one side and current is on the other). Returns the
+    bars-back count, or None if no clean transition within max_lookback —
+    meaning price has been beyond the level longer than the window, i.e. the
+    breakout is sustained/old, not a fresh same-day event.
+
+    This replaces hardcoding bars_since_trigger=0 for "Breaking out" patterns,
+    which made a multi-day consolidation around a trigger re-stamp as a brand
+    new breakout on every daily scan.
+    """
+    closes = df["Close"]
+    n = len(closes)
+    if n < 2:
+        return None
+    for back in range(max_lookback + 1):
+        idx = n - 1 - back
+        if idx < 1:
+            return None
+        cur = float(closes.iloc[idx])
+        prev = float(closes.iloc[idx - 1])
+        if direction == "BREAKOUT":
+            if cur > level and prev <= level:
+                return back
+        else:  # BREAKDOWN
+            if cur < level and prev >= level:
+                return back
+    return None
+
+
 def find_donchian_setups(df: pd.DataFrame, atr: float, periods: list[int]) -> list[Setup]:
     """Emit Donchian setups using the PRIOR N-day window (excluding today).
 
@@ -541,7 +573,21 @@ def find_pattern_setups(pattern_results, df: pd.DataFrame, atr: float) -> list[S
         if p.notes and "rescored" in p.notes:
             rationale.append("distant pattern — early-forming")
 
-        bars_since_trigger = 0 if p.status == "Breaking out" else None
+        if p.status == "Breaking out":
+            # Pin to the ACTUAL cross bar instead of hardcoding 0. A pattern
+            # can stay "Breaking out" (price within 1% of the trigger) for
+            # many sessions; without this it re-stamps as a fresh same-day
+            # breakout every scan and monopolises the headline.
+            bst = _bars_since_level_cross(df, trigger, direction, max_lookback=60)
+            if bst is None:
+                # No clean close transition in 60 bars — price has held
+                # beyond the trigger for a long time. Treat as a stale
+                # trigger (use pattern age, floored above the fresh/recent
+                # window) so it never shows as FRESH BREAKOUT today.
+                bst = max(age_days, 6)
+            bars_since_trigger = bst
+        else:
+            bars_since_trigger = None
 
         setups.append(Setup(
             direction=direction,
@@ -2326,7 +2372,15 @@ def headline_takeaway(setups: list[Setup], last_price: float) -> dict:
     pending = [s for s in setups if not s.is_triggered]
 
     # ── 1. Fresh trigger today ──────────────────────────────────────
-    fresh_today = [s for s in triggered if s.bars_since_trigger == 0]
+    # DAILY timeframe only: a weekly setup with bars_since_trigger == 0
+    # means "this week" (could be Monday's cross showing all week), not a
+    # genuine same-day breakout. Weekly structure is represented by the
+    # channel/weekly tiers below — it shouldn't claim the FRESH BREAKOUT
+    # headline, which is specifically a "this just happened today" signal.
+    fresh_today = [
+        s for s in triggered
+        if s.bars_since_trigger == 0 and s.timeframe == "daily"
+    ]
     if fresh_today:
         s = max(fresh_today, key=lambda x: x.quality)
         if s.direction == "BREAKOUT":
