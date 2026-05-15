@@ -65,7 +65,7 @@ PORTFOLIO_FILE = Path("portfolio.txt")
 
 # Bump when the watchlist schema changes so cached files get regenerated
 # on deploy instead of sticking around until the next trading day.
-WATCHLIST_SCHEMA_VERSION = 2
+WATCHLIST_SCHEMA_VERSION = 3
 
 # Session timing (US market, ET)
 MARKET_OPEN  = dtime(9, 30)
@@ -87,6 +87,17 @@ def _is_channel_kind(kind: str) -> bool:
     formatted alerts and bypassed close-buffer logic, since touching the
     rail (even on a wick that rejects) is itself the signal."""
     return kind.startswith("CHANNEL_")
+
+
+def _is_touch_eligible_kind(kind: str) -> bool:
+    """Horizontal S/R and moving-average levels get an ADDITIONAL wick-based
+    touch twin (alongside the normal close-based break alert). Touching the
+    level is the decision point — bounce ('breakdown avoided') or break —
+    so the user wants the ping the moment price tags it."""
+    return (
+        kind in ("HORIZONTAL_SUPPORT", "HORIZONTAL_RESISTANCE")
+        or kind.startswith("MA_")
+    )
 
 
 # Rebuild the watchlist mid-day to catch setups that only formed after the
@@ -111,13 +122,17 @@ class WatchSetup:
     # triggered today. Watcher uses a 0.5-ATR confirmation buffer for these
     # so we only ping on real continuation, not noise around the breakout.
     is_follow_through: bool = False
+    # When True, this is a wick-based TOUCH twin of a horizontal S/R or MA
+    # level — fires the moment price tags the level (decision point: bounce
+    # or break) rather than waiting for a confirming close.
+    is_touch: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, d: dict) -> "WatchSetup":
-        # Tolerate older watchlists missing the follow-through field
+        # Tolerate older watchlists missing newer fields
         return cls(
             kind=d["kind"],
             direction=d["direction"],
@@ -126,6 +141,7 @@ class WatchSetup:
             quality_label=d["quality_label"],
             atr=d["atr"],
             is_follow_through=bool(d.get("is_follow_through", False)),
+            is_touch=bool(d.get("is_touch", False)),
         )
 
 
@@ -223,14 +239,33 @@ def build_watchlist(tickers: list[str]) -> dict[str, list[WatchSetup]]:
 
         if not candidates:
             continue
-        # Closest-to-price first; cap to limit
-        candidates.sort(key=lambda w: abs(w.trigger))  # placeholder; we sort below by quality+proximity below
-        # Better: sort by absolute distance from current price using last close
+        # Sort by absolute distance from current price, then cap. The limit
+        # governs the number of distinct LEVELS — touch twins added below
+        # are bonus and don't count against it.
         last = (r.result.get("price") or {}).get("last") or 0.0
         if last:
             candidates.sort(key=lambda w: abs(w.trigger - float(last)))
         candidates = candidates[:PER_TICKER_LIMIT]
-        watchlist[r.ticker] = candidates
+
+        # For horizontal S/R and MA levels, add a wick-based TOUCH twin so
+        # the user gets pinged the moment price tags the level (decision
+        # point) in addition to the close-based break confirmation.
+        twins: list[WatchSetup] = []
+        for w in candidates:
+            if w.is_follow_through:
+                continue
+            if _is_touch_eligible_kind(w.kind):
+                twins.append(WatchSetup(
+                    kind=w.kind,
+                    direction=w.direction,
+                    trigger=w.trigger,
+                    label=w.label,
+                    quality_label=w.quality_label,
+                    atr=w.atr,
+                    is_follow_through=False,
+                    is_touch=True,
+                ))
+        watchlist[r.ticker] = candidates + twins
 
     return watchlist
 
@@ -293,10 +328,16 @@ def save_state(state: dict) -> None:
 
 
 def alert_key(ticker: str, setup: WatchSetup, date_str: str) -> str:
-    # Round trigger to 2dp so float jitter doesn't break dedup. The FT marker
-    # keeps follow-through alerts dedup-separate from initial-cross alerts.
-    ft = "FT" if setup.is_follow_through else "X"
-    return f"{ticker}|{setup.kind}|{ft}|{setup.trigger:.2f}|{date_str}"
+    # Round trigger to 2dp so float jitter doesn't break dedup. The marker
+    # keeps follow-through / touch / initial-cross alerts dedup-separate so
+    # a touch ping and its later break ping don't suppress each other.
+    if setup.is_touch:
+        marker = "TCH"
+    elif setup.is_follow_through:
+        marker = "FT"
+    else:
+        marker = "X"
+    return f"{ticker}|{setup.kind}|{marker}|{setup.trigger:.2f}|{date_str}"
 
 
 # ─────────────────────────────────────────────────────────────
@@ -391,6 +432,18 @@ def format_alert(ticker: str, setup: WatchSetup, bar: dict) -> str:
             f"<i>{bar_time_et}</i>",
         ])
 
+    # Horizontal S/R or MA level touch — decision-point ping
+    if setup.is_touch:
+        touched_price = bar["high"] if setup.direction == "BREAKOUT" else bar["low"]
+        chg = (touched_price - setup.trigger) / setup.trigger * 100
+        held = "resistance" if setup.direction == "BREAKOUT" else "support"
+        return "\n".join([
+            f"<b>📍 LEVEL TOUCH — {ticker}</b>",
+            f"<code>${touched_price:.2f}</code>  ({chg:+.2f}% vs level)",
+            f"Tagged {held} <b>{setup.label.upper()}</b> @ <code>${setup.trigger:.2f}</code>",
+            f"<i>watch for bounce or break · {bar_time_et}</i>",
+        ])
+
     # Channel rail touch — distinct from a breakout ping
     if _is_channel_kind(setup.kind):
         rail_side = "UPPER" if "UPPER" in setup.kind else ("LOWER" if "LOWER" in setup.kind else "RAIL")
@@ -446,6 +499,14 @@ def is_cross(bar: dict, setup: WatchSetup) -> bool:
     # in the direction the analyzer flagged. Captures both reversal and
     # breakout scenarios; user decides what to do from the chart.
     if _is_channel_kind(setup.kind):
+        if setup.direction == "BREAKOUT":
+            return bar["high"] >= setup.trigger
+        return bar["low"] <= setup.trigger
+
+    # Horizontal S/R or MA TOUCH twin — wick-based, same decision-point
+    # logic as channel touches. The close-based break alert for this same
+    # level is a separate WatchSetup and fires independently.
+    if setup.is_touch:
         if setup.direction == "BREAKOUT":
             return bar["high"] >= setup.trigger
         return bar["low"] <= setup.trigger
