@@ -37,7 +37,7 @@ import time
 import traceback
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, asdict, field, replace
 from datetime import datetime, time as dtime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -180,6 +180,21 @@ def _atr_from_result(result: dict) -> float:
     return float(tr.rolling(14).mean().iloc[-1] or 0.0)
 
 
+def _rolling_52w_extreme(df, want_high: bool):
+    """True trailing-252-trading-day extreme EXCLUDING today's live/partial
+    bar. This is the *correct* reference for a 'new 52-week high' — not the
+    analyzer's setup trigger_price, which is the stale original breakout
+    level (price may sit far above it, making a wick check always-true and
+    firing false 'new high' pings even on a -4% day). Returns None if there
+    isn't enough history to be meaningful."""
+    if df is None or df.empty or len(df) < 30:
+        return None
+    window = df.iloc[-253:-1]            # 252 bars ending yesterday
+    if window.empty:
+        return None
+    return float(window["High"].max()) if want_high else float(window["Low"].min())
+
+
 def build_watchlist(tickers: list[str]) -> dict[str, list[WatchSetup]]:
     """Run the daily scan and extract STRONG-quality breakout / breakdown
     triggers per ticker. Limited to top PER_TICKER_LIMIT setups by quality."""
@@ -236,6 +251,31 @@ def build_watchlist(tickers: list[str]) -> dict[str, list[WatchSetup]]:
                 atr=atr,
                 is_follow_through=True,
             ))
+
+        # ── 52-week high/low correction ─────────────────────────────────
+        # Replace the analyzer's stale breakout-level trigger with the TRUE
+        # trailing-252-day extreme (excluding today), force off the
+        # follow-through path (these always use the fresh wick check), and
+        # collapse duplicate 52w kinds so a genuine new high pings once, not
+        # once per detector (DONCHIAN_252_HIGH + WEEKLY_52W_HIGH).
+        df_daily = r.result.get("df_daily")
+        hi_252 = _rolling_52w_extreme(df_daily, want_high=True)
+        lo_252 = _rolling_52w_extreme(df_daily, want_high=False)
+        fixed: list[WatchSetup] = []
+        seen_hi = seen_lo = False
+        for w in candidates:
+            if w.kind in _52W_HIGH_KINDS:
+                if seen_hi or hi_252 is None:
+                    continue
+                seen_hi = True
+                w = replace(w, trigger=hi_252, is_follow_through=False)
+            elif w.kind in _52W_LOW_KINDS:
+                if seen_lo or lo_252 is None:
+                    continue
+                seen_lo = True
+                w = replace(w, trigger=lo_252, is_follow_through=False)
+            fixed.append(w)
+        candidates = fixed
 
         if not candidates:
             continue
