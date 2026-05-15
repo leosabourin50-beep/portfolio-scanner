@@ -474,13 +474,11 @@ def format_alert(ticker: str, setup: WatchSetup, bar: dict) -> str:
 
     # Horizontal S/R or MA level touch — decision-point ping
     if setup.is_touch:
-        touched_price = bar["high"] if setup.direction == "BREAKOUT" else bar["low"]
-        chg = (touched_price - setup.trigger) / setup.trigger * 100
         held = "resistance" if setup.direction == "BREAKOUT" else "support"
         return "\n".join([
             f"<b>📍 LEVEL TOUCH — {ticker}</b>",
-            f"<code>${touched_price:.2f}</code>  ({chg:+.2f}% vs level)",
             f"Tagged {held} <b>{setup.label.upper()}</b> @ <code>${setup.trigger:.2f}</code>",
+            f"Now <code>${bar['close']:.2f}</code>",
             f"<i>watch for bounce or break · {bar_time_et}</i>",
         ])
 
@@ -490,13 +488,11 @@ def format_alert(ticker: str, setup: WatchSetup, bar: dict) -> str:
         tf = "WEEKLY" if "WEEKLY" in setup.kind else "DAILY"
         slope = "ASCENDING" if "ASCENDING" in setup.kind else (
                 "DESCENDING" if "DESCENDING" in setup.kind else "CHANNEL")
-        touched_price = bar["high"] if setup.direction == "BREAKOUT" else bar["low"]
-        chg = (touched_price - setup.trigger) / setup.trigger * 100
         return "\n".join([
             f"<b>📍 CHANNEL TOUCH — {ticker}</b>",
-            f"<code>${touched_price:.2f}</code>  ({chg:+.2f}% vs rail)",
-            f"{tf} {slope} channel — {rail_side.lower()} rail at <code>${setup.trigger:.2f}</code>",
-            f"<i>{bar_time_et}</i>",
+            f"{tf} {slope} channel — {rail_side.lower()} rail @ <code>${setup.trigger:.2f}</code>",
+            f"Now <code>${bar['close']:.2f}</code>",
+            f"<i>watch for bounce or break · {bar_time_et}</i>",
         ])
 
     arrow = "▲" if setup.direction == "BREAKOUT" else "▼"
@@ -535,21 +531,13 @@ def is_cross(bar: dict, setup: WatchSetup) -> bool:
     if setup.kind in _52W_LOW_KINDS:
         return bar["low"] < setup.trigger
 
-    # Channel rail TOUCH — wick-based, fires when price reaches the rail
-    # in the direction the analyzer flagged. Captures both reversal and
-    # breakout scenarios; user decides what to do from the chart.
-    if _is_channel_kind(setup.kind):
-        if setup.direction == "BREAKOUT":
-            return bar["high"] >= setup.trigger
-        return bar["low"] <= setup.trigger
-
-    # Horizontal S/R or MA TOUCH twin — wick-based, same decision-point
-    # logic as channel touches. The close-based break alert for this same
-    # level is a separate WatchSetup and fires independently.
-    if setup.is_touch:
-        if setup.direction == "BREAKOUT":
-            return bar["high"] >= setup.trigger
-        return bar["low"] <= setup.trigger
+    # Channel rail / level TOUCH — a genuine touch means price actually
+    # TRADED at the level during this bar, i.e. the trigger falls inside the
+    # bar's [low, high] range. A one-sided wick check (bar.high >= trigger)
+    # is trivially always-true whenever price sits far from the level (e.g.
+    # KLAC -4% but still well above a low rail), producing false touches.
+    if _is_channel_kind(setup.kind) or setup.is_touch:
+        return bar["low"] <= setup.trigger <= bar["high"]
 
     atr_mult = ATR_FOLLOW_THROUGH if setup.is_follow_through else ATR_CONFIRMATION
     buffer = max(setup.atr * atr_mult, setup.trigger * 0.0005)
