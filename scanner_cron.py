@@ -30,8 +30,9 @@ import os
 import sys
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, time as dtime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import portfolio_scanner as ps
 import single_name_analyzer as sna
@@ -40,6 +41,22 @@ import single_name_analyzer as sna
 DEFAULT_TIERS = ("FRESH_TRIGGER", "RECENT_TRIGGER", "IMMEDIATE_SETUP")
 PORTFOLIO_FILE = Path("portfolio.txt")
 STATE_FILE = Path(os.environ.get("ALERTS_STATE_PATH", ".alerts_state.json"))
+
+# The GitHub Actions cron fires on a fixed UTC window (it can't do
+# timezones), so the script itself gates delivery to US market hours in
+# Eastern time. ZoneInfo handles EST/EDT automatically — no DST juggling.
+# Window is 09:30–16:05 ET: covers the full session plus the 4:00 PM ET
+# closing-bar read, and excludes the post-close (5 PM+) runs.
+ET = ZoneInfo("America/New_York")
+MARKET_OPEN_ET  = dtime(9, 30)
+MARKET_CLOSE_ET = dtime(16, 5)
+
+
+def within_market_hours(now_utc: datetime | None = None) -> bool:
+    now_et = (now_utc or datetime.now(timezone.utc)).astimezone(ET)
+    if now_et.weekday() >= 5:          # Sat/Sun
+        return False
+    return MARKET_OPEN_ET <= now_et.time() <= MARKET_CLOSE_ET
 
 
 # ─────────────────────────────────────────────────────────────
@@ -171,6 +188,11 @@ def format_batch_header(n: int, total: int) -> str:
 # ─────────────────────────────────────────────────────────────
 
 def main() -> int:
+    if os.environ.get("IGNORE_MARKET_HOURS") != "1" and not within_market_hours():
+        now_et = datetime.now(ET).strftime("%Y-%m-%d %H:%M ET")
+        print(f"[skip] outside market hours ({now_et}) — no alerts sent")
+        return 0
+
     tickers = load_portfolio()
     if not tickers:
         print("[skip] no portfolio configured (set SCAN_PORTFOLIO or portfolio.txt)")
