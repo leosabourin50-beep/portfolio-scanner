@@ -65,7 +65,7 @@ PORTFOLIO_FILE = Path("portfolio.txt")
 
 # Bump when the watchlist schema changes so cached files get regenerated
 # on deploy instead of sticking around until the next trading day.
-WATCHLIST_SCHEMA_VERSION = 4
+WATCHLIST_SCHEMA_VERSION = 5
 
 # Session timing (US market, ET)
 MARKET_OPEN  = dtime(9, 30)
@@ -129,6 +129,9 @@ class WatchSetup:
     # 20-day average daily volume for this ticker — used to annotate alerts
     # with relative volume so a move's participation is visible at a glance.
     avg_daily_vol: float = 0.0
+    # Last price at watchlist-build time — lets the refresh digest rank
+    # levels by proximity-to-trigger without extra API calls.
+    last_price: float = 0.0
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -146,6 +149,7 @@ class WatchSetup:
             is_follow_through=bool(d.get("is_follow_through", False)),
             is_touch=bool(d.get("is_touch", False)),
             avg_daily_vol=float(d.get("avg_daily_vol", 0.0)),
+            last_price=float(d.get("last_price", 0.0)),
         )
 
 
@@ -311,14 +315,17 @@ def build_watchlist(tickers: list[str]) -> dict[str, list[WatchSetup]]:
                 ))
         final = candidates + twins
 
-        # Stamp 20-day average daily volume on every entry (excludes today's
-        # live/partial bar) so alerts can show relative volume.
+        # Stamp 20-day average daily volume (excludes today's live/partial
+        # bar) + last price on every entry, for the volume annotation and
+        # the refresh digest's proximity ranking.
         avg_dv = 0.0
         ddf = r.result.get("df_daily")
         if ddf is not None and not ddf.empty and len(ddf) > 21:
             avg_dv = float(ddf["Volume"].iloc[-21:-1].mean() or 0.0)
+        last_px = float((r.result.get("price") or {}).get("last") or 0.0)
         for w in final:
             w.avg_daily_vol = avg_dv
+            w.last_price = last_px
 
         watchlist[r.ticker] = final
 
@@ -571,6 +578,46 @@ def format_alert(ticker: str, setup: WatchSetup, bar: dict,
     return "\n".join(lines)
 
 
+def format_refresh_digest(
+    watchlist: dict[str, list[WatchSetup]], label: str, top_n: int = 6,
+) -> str | None:
+    """A 'state of the portfolio' digest sent at each (re)build: how many
+    tickers/levels are armed and the handful closest to firing, ranked by
+    distance from the build-time price to the trigger. Returns None if
+    there's nothing rankable (no prices)."""
+    n_tickers = len(watchlist)
+    n_levels = sum(len(v) for v in watchlist.values())
+
+    # Collapse touch twins (same ticker+kind+trigger) so a level isn't
+    # listed twice; keep the closest representative per level.
+    seen: dict[tuple, float] = {}
+    rows: list[tuple[float, str, str, str]] = []  # (dist_pct, glyph, ticker, label)
+    for tk, setups in watchlist.items():
+        for s in setups:
+            if not s.last_price or s.last_price <= 0 or not s.trigger:
+                continue
+            key = (tk, s.kind, round(s.trigger, 2))
+            if key in seen:
+                continue
+            seen[key] = 1.0
+            dist = (s.trigger - s.last_price) / s.last_price * 100.0
+            glyph = "▲" if s.direction == "BREAKOUT" else "▼"
+            rows.append((abs(dist), glyph, tk, f"{s.label} {dist:+.1f}%"))
+
+    if not rows:
+        return None
+    rows.sort(key=lambda x: x[0])
+    head = (
+        f"<b>🔄 WATCHLIST · {label} REFRESH</b>\n"
+        f"<i>{n_tickers} tickers · {n_levels} levels armed</i>\n"
+        f"Closest to firing:"
+    )
+    body = "\n".join(
+        f"{g} <b>{tk}</b> — {lbl}" for _, g, tk, lbl in rows[:top_n]
+    )
+    return head + "\n" + body
+
+
 # ─────────────────────────────────────────────────────────────
 # Cross detection
 # ─────────────────────────────────────────────────────────────
@@ -723,6 +770,12 @@ def main_loop() -> int:
 
     watchlist: dict[str, list[WatchSetup]] = {}
     rebuilt_hours_today: set[int] = set()
+    digests_sent_today: set[str] = set()
+
+    def _send_digest(label: str) -> None:
+        msg = format_refresh_digest(watchlist, label)
+        if msg and _send_telegram(msg):
+            print(f"[digest] sent {label} refresh digest")
 
     while True:
         try:
@@ -733,20 +786,36 @@ def main_loop() -> int:
                 wait = min(seconds_until_open(now), 3600)  # cap at 1 hour
                 print(f"[sleep] market state={state}, sleeping {int(wait)}s")
                 # New trading day starts after a sleep through the close — clear
-                # the rebuild bookkeeping so tomorrow's mid-day rebuilds fire.
+                # the rebuild/digest bookkeeping so tomorrow's fire.
                 rebuilt_hours_today.clear()
+                digests_sent_today.clear()
                 time.sleep(max(wait, 60))
                 continue
+
+            today_key = datetime.now(ET).strftime("%Y-%m-%d")
 
             if state == "opening_skip":
                 # Pre-build today's watchlist while we wait through the noisy open
                 if not watchlist:
                     watchlist = ensure_today_watchlist(portfolio)
+                # Morning "here's the day's board" digest — once per day
+                dk = f"{today_key}|OPEN"
+                if watchlist and dk not in digests_sent_today:
+                    _send_digest("MARKET OPEN")
+                    digests_sent_today.add(dk)
                 time.sleep(POLL_SEC)
                 continue
 
             # state == "open"
             watchlist = ensure_today_watchlist(portfolio)
+
+            # Cover the case where the watcher first comes up after the
+            # opening-skip window (deploy mid-session): still send the
+            # day's first digest once.
+            dk_open = f"{today_key}|OPEN"
+            if watchlist and dk_open not in digests_sent_today:
+                _send_digest("MARKET OPEN")
+                digests_sent_today.add(dk_open)
 
             # Mid-day rebuild: at the configured hours (12:00 ET, 14:00 ET) do
             # a fresh build so setups that only formed during the session get
@@ -756,6 +825,10 @@ def main_loop() -> int:
                 if now_et.hour == hr and hr not in rebuilt_hours_today:
                     watchlist = _force_rebuild_watchlist(portfolio)
                     rebuilt_hours_today.add(hr)
+                    dk_mid = f"{today_key}|{hr}"
+                    if dk_mid not in digests_sent_today:
+                        _send_digest(f"{hr}:00 ET")
+                        digests_sent_today.add(dk_mid)
                     break
 
             sent = check_once(watchlist)
