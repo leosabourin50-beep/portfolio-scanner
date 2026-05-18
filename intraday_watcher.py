@@ -65,7 +65,7 @@ PORTFOLIO_FILE = Path("portfolio.txt")
 
 # Bump when the watchlist schema changes so cached files get regenerated
 # on deploy instead of sticking around until the next trading day.
-WATCHLIST_SCHEMA_VERSION = 5
+WATCHLIST_SCHEMA_VERSION = 6
 
 # Session timing (US market, ET)
 MARKET_OPEN  = dtime(9, 30)
@@ -126,9 +126,14 @@ class WatchSetup:
     # level — fires the moment price tags the level (decision point: bounce
     # or break) rather than waiting for a confirming close.
     is_touch: bool = False
-    # 20-day average daily volume for this ticker — used to annotate alerts
-    # with relative volume so a move's participation is visible at a glance.
+    # 20-day average daily volume (from daily bars) — kept for reference /
+    # potential digest use. NOT used for RVOL (different volume universe
+    # than intraday aggs — see avg_5m_vol).
     avg_daily_vol: float = 0.0
+    # Mean volume of a 5-min bar over recent intraday history. RVOL is
+    # computed against THIS so numerator and denominator come from the
+    # same (intraday-aggregate) volume universe.
+    avg_5m_vol: float = 0.0
     # Last price at watchlist-build time — lets the refresh digest rank
     # levels by proximity-to-trigger without extra API calls.
     last_price: float = 0.0
@@ -149,6 +154,7 @@ class WatchSetup:
             is_follow_through=bool(d.get("is_follow_through", False)),
             is_touch=bool(d.get("is_touch", False)),
             avg_daily_vol=float(d.get("avg_daily_vol", 0.0)),
+            avg_5m_vol=float(d.get("avg_5m_vol", 0.0)),
             last_price=float(d.get("last_price", 0.0)),
         )
 
@@ -315,16 +321,20 @@ def build_watchlist(tickers: list[str]) -> dict[str, list[WatchSetup]]:
                 ))
         final = candidates + twins
 
-        # Stamp 20-day average daily volume (excludes today's live/partial
-        # bar) + last price on every entry, for the volume annotation and
-        # the refresh digest's proximity ranking.
+        # Stamp volume references + last price on every entry. avg_5m_vol
+        # is computed from recent INTRADAY 5-min bars (same universe RVOL
+        # is measured in) — critical: Polygon minute aggs sum to far less
+        # than the official daily volume, so mixing daily-bar and intraday
+        # volume deflates RVOL ~5x.
         avg_dv = 0.0
         ddf = r.result.get("df_daily")
         if ddf is not None and not ddf.empty and len(ddf) > 21:
             avg_dv = float(ddf["Volume"].iloc[-21:-1].mean() or 0.0)
+        avg_5m = _avg_5m_volume(r.ticker)
         last_px = float((r.result.get("price") or {}).get("last") or 0.0)
         for w in final:
             w.avg_daily_vol = avg_dv
+            w.avg_5m_vol = avg_5m
             w.last_price = last_px
 
         watchlist[r.ticker] = final
@@ -437,16 +447,39 @@ def fetch_latest_5m_bar(ticker: str) -> dict | None:
     }
 
 
-def _volume_context(ticker: str, avg_daily_vol: float, bar: dict) -> str | None:
-    """Relative-volume annotation for an alert. Returns a short string like
+def _avg_5m_volume(ticker: str, lookback_days: int = 7) -> float:
+    """Mean volume of a 5-min bar over the last `lookback_days` calendar
+    days of intraday history. Computed from the SAME aggregate feed RVOL is
+    measured against (Polygon minute aggs), so the ratio is apples-to-apples
+    — unlike daily-bar volume, which is a different, much larger universe."""
+    client = get_client()
+    end = datetime.now(ET).date()
+    start = end - timedelta(days=lookback_days)
+    try:
+        bars = list(client.get_aggs(
+            ticker=ticker, multiplier=5, timespan="minute",
+            from_=start.strftime("%Y-%m-%d"), to=end.strftime("%Y-%m-%d"),
+            adjusted=True, sort="asc", limit=5000,
+        ))
+    except Exception:
+        return 0.0
+    vols = [float(b.volume or 0) for b in bars if (b.volume or 0) > 0]
+    if not vols:
+        return 0.0
+    return sum(vols) / len(vols)
+
+
+def _volume_context(ticker: str, avg_5m_vol: float, bar: dict) -> str | None:
+    """Relative-volume annotation for an alert, e.g.
     'Vol 2.4× normal pace · this bar 3.1× avg 5m', or None if unavailable.
 
-    Session RVOL = (cumulative volume so far today) / (avg daily volume ×
-    fraction of the 9:30–16:00 session elapsed at the firing bar). >1 means
-    today is trading heavier than normal — real participation behind the
-    move. The per-bar multiple shows whether the firing bar itself was a
-    volume surge vs a typical 5-min bar (avg_daily_vol / 78 bars)."""
-    if not avg_daily_vol or avg_daily_vol <= 0:
+    Both metrics are measured purely in the intraday 5-min-aggregate volume
+    universe so the ratios are meaningful:
+      • this bar Nx  = firing bar volume / mean 5-min-bar volume
+      • Nx normal pace = today's cumulative vol so far / (mean 5-min-bar
+        volume × number of 5-min bars elapsed this session) — >1 means
+        today is running heavier than a typical day at this point."""
+    if not avg_5m_vol or avg_5m_vol <= 0:
         return None
     client = get_client()
     today = datetime.now(ET).date().strftime("%Y-%m-%d")
@@ -456,26 +489,23 @@ def _volume_context(ticker: str, avg_daily_vol: float, bar: dict) -> str | None:
             from_=today, to=today, adjusted=True, sort="asc", limit=120,
         ))
     except Exception:
-        return None
-    if not bars:
-        return None
+        bars = []
     cum_vol = sum(float(b.volume or 0) for b in bars)
 
     bar_et = bar["ts"].astimezone(ET)
     session_start = bar_et.replace(hour=9, minute=30, second=0, microsecond=0)
-    session_len = 6.5 * 3600.0
-    elapsed = max((bar_et - session_start).total_seconds(), 60.0)
-    frac = min(max(elapsed / session_len, 0.02), 1.0)
+    elapsed_min = max((bar_et - session_start).total_seconds() / 60.0, 5.0)
+    bars_elapsed = min(max(elapsed_min / 5.0, 1.0), 78.0)
 
-    expected = avg_daily_vol * frac
-    if expected <= 0:
-        return None
-    rvol = cum_vol / expected
-    avg_5m = avg_daily_vol / 78.0
-    bar_mult = (bar["volume"] / avg_5m) if avg_5m > 0 else 0.0
-    if rvol <= 0:
-        return None
-    return f"📊 Vol {rvol:.1f}× normal pace · this bar {bar_mult:.1f}× avg 5m"
+    expected_cum = avg_5m_vol * bars_elapsed
+    bar_mult = bar["volume"] / avg_5m_vol if avg_5m_vol > 0 else 0.0
+
+    if expected_cum > 0 and cum_vol > 0:
+        rvol = cum_vol / expected_cum
+        return f"📊 Vol {rvol:.1f}× normal pace · this bar {bar_mult:.1f}× avg 5m"
+    # No cumulative data — still give the per-bar multiple, it's the
+    # higher-signal half anyway.
+    return f"📊 This bar {bar_mult:.1f}× avg 5m volume"
 
 
 # ─────────────────────────────────────────────────────────────
@@ -715,7 +745,7 @@ def check_once(watchlist: dict[str, list[WatchSetup]]) -> int:
             if key in already:
                 continue
             if is_cross(bar, s):
-                vol_note = _volume_context(ticker, s.avg_daily_vol, bar)
+                vol_note = _volume_context(ticker, s.avg_5m_vol, bar)
                 if _send_telegram(format_alert(ticker, s, bar, vol_note)):
                     already.add(key)
                     sent += 1
