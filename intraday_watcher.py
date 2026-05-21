@@ -72,7 +72,7 @@ PORTFOLIO_FILE = Path("portfolio.txt")
 
 # Bump when the watchlist schema changes so cached files get regenerated
 # on deploy instead of sticking around until the next trading day.
-WATCHLIST_SCHEMA_VERSION = 7
+WATCHLIST_SCHEMA_VERSION = 8
 
 # Session timing (US market, ET)
 MARKET_OPEN  = dtime(9, 30)
@@ -87,6 +87,20 @@ ATR_FOLLOW_THROUGH = 0.50    # for already-triggered setups, require a stronger 
 # because the moment a 52w high prints is the moment that matters.
 _52W_HIGH_KINDS = {"DONCHIAN_252_HIGH", "WEEKLY_52W_HIGH"}
 _52W_LOW_KINDS  = {"DONCHIAN_252_LOW", "WEEKLY_52W_LOW"}
+
+
+def _setup_has_kind(setup, kinds: set) -> bool:
+    """True if the setup's own kind OR any kind absorbed in its confluence
+    merge matches. Critical so a PATTERN_* anchor that absorbed e.g.
+    WEEKLY_52W_HIGH still triggers the 52w-high special handling (wick-
+    based detection + trophy formatting) — without this, the merge silently
+    downgraded ATH alerts to standard close-buffer breakouts."""
+    if setup.kind in kinds:
+        return True
+    for k in (setup.confluence_kinds or []):
+        if k in kinds:
+            return True
+    return False
 
 
 def _is_channel_kind(kind: str) -> bool:
@@ -144,6 +158,11 @@ class WatchSetup:
     # Last price at watchlist-build time — lets the refresh digest rank
     # levels by proximity-to-trigger without extra API calls.
     last_price: float = 0.0
+    # Kinds of other setups absorbed into this one during confluence merge.
+    # Critical for not losing special semantics: a PATTERN_* that absorbs a
+    # WEEKLY_52W_HIGH should still fire wick-based with the trophy format,
+    # not the standard close-buffer breakout path.
+    confluence_kinds: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -163,6 +182,7 @@ class WatchSetup:
             avg_daily_vol=float(d.get("avg_daily_vol", 0.0)),
             avg_5m_vol=float(d.get("avg_5m_vol", 0.0)),
             last_price=float(d.get("last_price", 0.0)),
+            confluence_kinds=list(d.get("confluence_kinds") or []),
         )
 
 
@@ -266,6 +286,7 @@ def build_watchlist(
                 quality_label=s.quality_label,
                 atr=atr,
                 is_follow_through=False,
+                confluence_kinds=list(s.confluence_with or []),
             ))
 
         # Recently-triggered setups → follow-through (close >= trigger + 0.5
@@ -284,6 +305,7 @@ def build_watchlist(
                 quality_label=s.quality_label,
                 atr=atr,
                 is_follow_through=True,
+                confluence_kinds=list(s.confluence_with or []),
             ))
 
         # ── 52-week high/low correction ─────────────────────────────────
@@ -338,6 +360,7 @@ def build_watchlist(
                     atr=w.atr,
                     is_follow_through=False,
                     is_touch=True,
+                    confluence_kinds=list(w.confluence_kinds or []),
                 ))
         final = candidates + twins
 
@@ -588,22 +611,29 @@ def format_alert(ticker: str, setup: WatchSetup, bar: dict,
                   vol_note: str | None = None) -> str:
     bar_time_et = bar["ts"].astimezone(ET).strftime("%H:%M ET")
 
-    # Special-case 52-week high / low — distinct trophy/down-trend formatting
-    if setup.kind in _52W_HIGH_KINDS:
+    # Special-case 52-week high / low — distinct trophy/down-trend formatting.
+    # Also fires when a pattern setup absorbed a 52w-kind via confluence
+    # merge (e.g. PATTERN_BULL_BULL_FLAG sitting on a WEEKLY_52W_HIGH).
+    if _setup_has_kind(setup, _52W_HIGH_KINDS):
         chg = (bar["high"] - setup.trigger) / setup.trigger * 100
         lines = [
             f"<b>🏆 NEW 52-WEEK HIGH — {ticker}</b>",
             f"<code>${bar['high']:.2f}</code>  ({chg:+.2f}% past prior 52wh)",
             f"Prior high <code>${setup.trigger:.2f}</code>",
         ]
+        # If a chart pattern sits on this level too, surface that for context
+        if setup.kind.startswith("PATTERN_"):
+            lines.append(f"<i>Confluence: {setup.label}</i>")
         footer = bar_time_et
-    elif setup.kind in _52W_LOW_KINDS:
+    elif _setup_has_kind(setup, _52W_LOW_KINDS):
         chg = (bar["low"] - setup.trigger) / setup.trigger * 100
         lines = [
             f"<b>📉 NEW 52-WEEK LOW — {ticker}</b>",
             f"<code>${bar['low']:.2f}</code>  ({chg:+.2f}% past prior 52wl)",
             f"Prior low <code>${setup.trigger:.2f}</code>",
         ]
+        if setup.kind.startswith("PATTERN_"):
+            lines.append(f"<i>Confluence: {setup.label}</i>")
         footer = bar_time_et
     elif setup.is_touch:
         # Horizontal S/R or MA level touch — decision-point ping
@@ -728,10 +758,13 @@ def is_cross(bar: dict, setup: WatchSetup) -> bool:
     Follow-through setups (level already triggered today): bar close must
     extend >= 0.5 ATR past the level — captures real continuation rather
     than chop around the breakout level."""
-    # 52-week high/low: pure wick check, no buffer
-    if setup.kind in _52W_HIGH_KINDS:
+    # 52-week high/low: pure wick check, no buffer. Also covers patterns
+    # that absorbed a WEEKLY_52W_HIGH via confluence merge — without this
+    # check, a Bull Flag sitting on top of a 52w high silently downgrades
+    # to the close-buffer breakout path (caught STM today).
+    if _setup_has_kind(setup, _52W_HIGH_KINDS):
         return bar["high"] > setup.trigger
-    if setup.kind in _52W_LOW_KINDS:
+    if _setup_has_kind(setup, _52W_LOW_KINDS):
         return bar["low"] < setup.trigger
 
     # Channel rail / level TOUCH — a genuine touch means price actually
