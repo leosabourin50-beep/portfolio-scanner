@@ -56,6 +56,13 @@ ET = ZoneInfo("America/New_York")
 POLL_SEC = int(os.environ.get("WATCHER_POLL_SEC", "60"))
 PER_TICKER_LIMIT = int(os.environ.get("PER_TICKER_LIMIT", "3"))
 
+# Violent-move detection. Fires when a single 5-min bar's close differs from
+# the previous bar's close by at least VIOLENT_MOVE_PCT, AND the bar's
+# volume is at least VIOLENT_MOVE_VOL_MULT times the avg 5-min bar. Catches
+# vertical surges/drops that don't happen to cross any pre-curated level.
+VIOLENT_MOVE_PCT      = float(os.environ.get("VIOLENT_MOVE_PCT", "3.0"))
+VIOLENT_MOVE_VOL_MULT = float(os.environ.get("VIOLENT_MOVE_VOL_MULT", "2.5"))
+
 # Default state paths: prefer /data (Fly volume) if it exists, else cwd
 _DATA_DIR = Path("/data") if Path("/data").is_dir() else Path(".")
 WATCHLIST_PATH = Path(os.environ.get("WATCHLIST_PATH", _DATA_DIR / "intraday_watchlist.json"))
@@ -416,35 +423,38 @@ def alert_key(ticker: str, setup: WatchSetup, date_str: str) -> str:
 # Polygon intraday fetch
 # ─────────────────────────────────────────────────────────────
 
-def fetch_latest_5m_bar(ticker: str) -> dict | None:
-    """Returns the most recent completed 5-min bar as a dict, or None."""
+def fetch_recent_5m_bars(ticker: str, n: int = 3) -> list[dict] | None:
+    """Returns the most-recent n 5-min bars (newest-first), or None on
+    error/empty. Used by both the level-cross check (needs bars[0]) and the
+    violent-move detector (needs bars[0].close vs bars[1].close)."""
     client = get_client()
-    today_et = datetime.now(ET).date()
-    today_str = today_et.strftime("%Y-%m-%d")
+    today_str = datetime.now(ET).date().strftime("%Y-%m-%d")
     try:
-        # Last-3-bar fetch — gives us the latest bar plus a buffer for any
-        # delayed bar prints.
         bars = list(client.get_aggs(
-            ticker=ticker,
-            multiplier=5, timespan="minute",
+            ticker=ticker, multiplier=5, timespan="minute",
             from_=today_str, to=today_str,
-            adjusted=True, sort="desc", limit=3,
+            adjusted=True, sort="desc", limit=n,
         ))
     except Exception as e:
         print(f"[error] polygon fetch failed for {ticker}: {e}", file=sys.stderr)
         return None
     if not bars:
         return None
-    # bars[0] is the most recent. Polygon timestamp is ms unix.
-    b = bars[0]
-    return {
-        "ts": datetime.fromtimestamp(b.timestamp / 1000, tz=timezone.utc),
-        "open": float(b.open),
-        "high": float(b.high),
-        "low": float(b.low),
-        "close": float(b.close),
-        "volume": float(b.volume or 0),
-    }
+    return [
+        {
+            "ts": datetime.fromtimestamp(b.timestamp / 1000, tz=timezone.utc),
+            "open": float(b.open), "high": float(b.high),
+            "low": float(b.low), "close": float(b.close),
+            "volume": float(b.volume or 0),
+        }
+        for b in bars
+    ]
+
+
+def fetch_latest_5m_bar(ticker: str) -> dict | None:
+    """Returns the most recent completed 5-min bar as a dict, or None."""
+    bars = fetch_recent_5m_bars(ticker, n=3)
+    return bars[0] if bars else None
 
 
 def _avg_5m_volume(ticker: str, lookback_days: int = 7) -> float:
@@ -608,6 +618,27 @@ def format_alert(ticker: str, setup: WatchSetup, bar: dict,
     return "\n".join(lines)
 
 
+def format_violent_move(
+    ticker: str, bar: dict, chg_pct: float, vol_mult: float,
+) -> str:
+    """Big single-bar move alert — independent of any pre-curated level.
+    Fires on vertical surges/drops the level watcher can't see."""
+    bar_time_et = bar["ts"].astimezone(ET).strftime("%H:%M ET")
+    if chg_pct >= 0:
+        return "\n".join([
+            f"<b>🚀 VIOLENT MOVE UP — {ticker}</b>",
+            f"<code>${bar['close']:.2f}</code>  ({chg_pct:+.2f}% on the 5-min bar)",
+            f"📊 {vol_mult:.1f}× avg 5m volume",
+            f"<i>5-min bar close · {bar_time_et}</i>",
+        ])
+    return "\n".join([
+        f"<b>🔻 VIOLENT DROP — {ticker}</b>",
+        f"<code>${bar['close']:.2f}</code>  ({chg_pct:+.2f}% on the 5-min bar)",
+        f"📊 {vol_mult:.1f}× avg 5m volume",
+        f"<i>5-min bar close · {bar_time_et}</i>",
+    ])
+
+
 def format_refresh_digest(
     watchlist: dict[str, list[WatchSetup]], label: str, top_n: int = 6,
 ) -> str | None:
@@ -734,12 +765,25 @@ def check_once(watchlist: dict[str, list[WatchSetup]]) -> int:
     for ticker, setups in watchlist.items():
         if not setups:
             continue
-        # Skip the fetch if every setup for this ticker is already alerted today
-        if all(alert_key(ticker, s, today_et) in already for s in setups):
+        # Pre-compute violent-move dedup key. If all level-cross alerts AND
+        # both violent-move directions are already alerted, skip the fetch.
+        vm_up_key   = f"{ticker}|VIOLENT_MOVE|UP|{today_et}"
+        vm_down_key = f"{ticker}|VIOLENT_MOVE|DOWN|{today_et}"
+        levels_done = all(alert_key(ticker, s, today_et) in already for s in setups)
+        vm_done = vm_up_key in already and vm_down_key in already
+        if levels_done and vm_done:
             continue
-        bar = fetch_latest_5m_bar(ticker)
-        if bar is None:
+
+        # One fetch per ticker — bars[0] is the latest, bars[1] is the
+        # prior bar (used as the baseline for violent-move % change).
+        bars = fetch_recent_5m_bars(ticker, n=3)
+        if not bars:
             continue
+        bar = bars[0]
+        prev_close = float(bars[1]["close"]) if len(bars) >= 2 else None
+        avg_5m_vol = setups[0].avg_5m_vol if setups else 0.0
+
+        # ── Level-cross alerts ─────────────────────────────────────────
         for s in setups:
             key = alert_key(ticker, s, today_et)
             if key in already:
@@ -755,6 +799,23 @@ def check_once(watchlist: dict[str, list[WatchSetup]]) -> int:
                         f"[retry] {ticker} {s.kind} delivery failed — will retry next poll",
                         file=sys.stderr,
                     )
+
+        # ── Violent-move alert (independent of pre-curated levels) ─────
+        if prev_close and prev_close > 0 and avg_5m_vol > 0:
+            chg_pct = (bar["close"] - prev_close) / prev_close * 100.0
+            vol_mult = bar["volume"] / avg_5m_vol
+            if abs(chg_pct) >= VIOLENT_MOVE_PCT and vol_mult >= VIOLENT_MOVE_VOL_MULT:
+                vm_key = vm_up_key if chg_pct > 0 else vm_down_key
+                if vm_key not in already:
+                    if _send_telegram(format_violent_move(ticker, bar, chg_pct, vol_mult)):
+                        already.add(vm_key)
+                        sent += 1
+                        print(f"[alert] {ticker} VIOLENT_MOVE {chg_pct:+.2f}% on {vol_mult:.1f}× vol")
+                    else:
+                        print(
+                            f"[retry] {ticker} violent-move delivery failed — will retry next poll",
+                            file=sys.stderr,
+                        )
 
     if sent:
         state["alerted"] = sorted(already)
