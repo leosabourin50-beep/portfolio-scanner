@@ -468,11 +468,23 @@ def fetch_latest_5m_bar(ticker: str) -> dict | None:
     return bars[0] if bars else None
 
 
-def _avg_5m_volume(ticker: str, lookback_days: int = 7) -> float:
-    """Mean volume of a 5-min bar over the last `lookback_days` calendar
-    days of intraday history. Computed from the SAME aggregate feed RVOL is
-    measured against (Polygon minute aggs), so the ratio is apples-to-apples
-    — unlike daily-bar volume, which is a different, much larger universe."""
+def _is_rth_bar(b) -> bool:
+    """Polygon's intraday aggs include pre-market (4:00–9:30 ET) and after-
+    hours (16:00–20:00 ET), where 5-min bars trade hundreds to single-digit
+    thousand shares. Mixing those into the avg destroys the baseline (a
+    typical regular-hours bar then looks like 10× normal). Restrict to
+    regular trading hours: 9:30 ≤ bar start < 16:00 ET."""
+    bar_et = datetime.fromtimestamp(b.timestamp / 1000, tz=timezone.utc).astimezone(ET)
+    if bar_et.weekday() >= 5:
+        return False
+    t = bar_et.time()
+    return MARKET_OPEN <= t < MARKET_CLOSE
+
+
+def _avg_5m_volume(ticker: str, lookback_days: int = 10) -> float:
+    """Mean volume of a regular-hours 5-min bar over the last
+    `lookback_days` calendar days. RTH-only so the baseline reflects normal
+    session participation, not pre/post-market thin bars."""
     client = get_client()
     end = datetime.now(ET).date()
     start = end - timedelta(days=lookback_days)
@@ -484,7 +496,8 @@ def _avg_5m_volume(ticker: str, lookback_days: int = 7) -> float:
         ))
     except Exception:
         return 0.0
-    vols = [float(b.volume or 0) for b in bars if (b.volume or 0) > 0]
+    vols = [float(b.volume or 0) for b in bars
+            if (b.volume or 0) > 0 and _is_rth_bar(b)]
     if not vols:
         return 0.0
     return sum(vols) / len(vols)
@@ -511,21 +524,27 @@ def _volume_context(ticker: str, avg_5m_vol: float, bar: dict) -> str | None:
         ))
     except Exception:
         bars = []
-    cum_vol = sum(float(b.volume or 0) for b in bars)
+    # RTH-only cumulative: pre/post-market volume isn't comparable to the
+    # RTH-baseline avg_5m_vol, so it has to be excluded from both sides.
+    cum_vol = sum(float(b.volume or 0) for b in bars if _is_rth_bar(b))
 
     bar_et = bar["ts"].astimezone(ET)
-    session_start = bar_et.replace(hour=9, minute=30, second=0, microsecond=0)
-    elapsed_min = max((bar_et - session_start).total_seconds() / 60.0, 5.0)
-    bars_elapsed = min(max(elapsed_min / 5.0, 1.0), 78.0)
+    # Bars elapsed since 9:30 ET (clamped to session bounds). If the firing
+    # bar is pre-market, the session pace ratio is undefined — fall back to
+    # the per-bar multiple alone.
+    open_today = bar_et.replace(hour=9, minute=30, second=0, microsecond=0)
+    close_today = bar_et.replace(hour=16, minute=0, second=0, microsecond=0)
+    in_rth = open_today <= bar_et < close_today
+    elapsed_min = (bar_et - open_today).total_seconds() / 60.0
+    bars_elapsed = max(min(elapsed_min / 5.0, 78.0), 1.0) if in_rth else 0.0
 
     expected_cum = avg_5m_vol * bars_elapsed
     bar_mult = bar["volume"] / avg_5m_vol if avg_5m_vol > 0 else 0.0
 
-    if expected_cum > 0 and cum_vol > 0:
+    if in_rth and expected_cum > 0 and cum_vol > 0:
         rvol = cum_vol / expected_cum
         return f"📊 Vol {rvol:.1f}× normal pace · this bar {bar_mult:.1f}× avg 5m"
-    # No cumulative data — still give the per-bar multiple, it's the
-    # higher-signal half anyway.
+    # Pre-market or no RTH cumulative yet — just the per-bar multiple.
     return f"📊 This bar {bar_mult:.1f}× avg 5m volume"
 
 
