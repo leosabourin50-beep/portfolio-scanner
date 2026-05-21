@@ -72,7 +72,7 @@ PORTFOLIO_FILE = Path("portfolio.txt")
 
 # Bump when the watchlist schema changes so cached files get regenerated
 # on deploy instead of sticking around until the next trading day.
-WATCHLIST_SCHEMA_VERSION = 6
+WATCHLIST_SCHEMA_VERSION = 7
 
 # Session timing (US market, ET)
 MARKET_OPEN  = dtime(9, 30)
@@ -216,18 +216,31 @@ def _rolling_52w_extreme(df, want_high: bool):
     return float(window["High"].max()) if want_high else float(window["Low"].min())
 
 
-def build_watchlist(tickers: list[str]) -> dict[str, list[WatchSetup]]:
+def build_watchlist(
+    tickers: list[str],
+) -> tuple[dict[str, list[WatchSetup]], dict[str, dict]]:
     """Run the daily scan and extract STRONG-quality breakout / breakdown
-    triggers per ticker. Limited to top PER_TICKER_LIMIT setups by quality."""
+    triggers per ticker. Returns:
+      • watchlist: ticker -> list[WatchSetup] (only tickers with qualifying
+        level setups appear here)
+      • portfolio_meta: ticker -> {avg_5m_vol, last_price} for EVERY
+        analyzed portfolio ticker, including "quiet" ones with no setups.
+        Powers level-independent alerts (violent-move) on all names."""
     cfg = sna.load_config()
     print(f"[watchlist] scanning {len(tickers)} tickers to build watchlist...")
     reads = ps.scan_portfolio(tickers, cfg=cfg, max_workers=8)
 
     watchlist: dict[str, list[WatchSetup]] = {}
+    portfolio_meta: dict[str, dict] = {}
     for r in reads:
         if r.result.get("error"):
             continue
         atr = _atr_from_result(r.result)
+        # Stamp per-ticker metadata for EVERY analyzed ticker (incl. quiet
+        # ones with no setups) so the violent-move scan can run on them.
+        avg_5m = _avg_5m_volume(r.ticker)
+        last_px = float((r.result.get("price") or {}).get("last") or 0.0)
+        portfolio_meta[r.ticker] = {"avg_5m_vol": avg_5m, "last_price": last_px}
         candidates: list[WatchSetup] = []
 
         def _qualifies(s) -> bool:
@@ -328,17 +341,12 @@ def build_watchlist(tickers: list[str]) -> dict[str, list[WatchSetup]]:
                 ))
         final = candidates + twins
 
-        # Stamp volume references + last price on every entry. avg_5m_vol
-        # is computed from recent INTRADAY 5-min bars (same universe RVOL
-        # is measured in) — critical: Polygon minute aggs sum to far less
-        # than the official daily volume, so mixing daily-bar and intraday
-        # volume deflates RVOL ~5x.
+        # Stamp volume references + last price on every entry. avg_5m and
+        # last_px were already computed above for portfolio_meta — reuse.
         avg_dv = 0.0
         ddf = r.result.get("df_daily")
         if ddf is not None and not ddf.empty and len(ddf) > 21:
             avg_dv = float(ddf["Volume"].iloc[-21:-1].mean() or 0.0)
-        avg_5m = _avg_5m_volume(r.ticker)
-        last_px = float((r.result.get("price") or {}).get("last") or 0.0)
         for w in final:
             w.avg_daily_vol = avg_dv
             w.avg_5m_vol = avg_5m
@@ -346,34 +354,37 @@ def build_watchlist(tickers: list[str]) -> dict[str, list[WatchSetup]]:
 
         watchlist[r.ticker] = final
 
-    return watchlist
+    return watchlist, portfolio_meta
 
 
-def save_watchlist(watchlist: dict[str, list[WatchSetup]]) -> None:
+def save_watchlist(
+    watchlist: dict[str, list[WatchSetup]],
+    portfolio_meta: dict[str, dict],
+) -> None:
     payload = {
         "schema_version": WATCHLIST_SCHEMA_VERSION,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "tickers": {tk: [w.to_dict() for w in ws] for tk, ws in watchlist.items()},
+        "portfolio_meta": portfolio_meta,
     }
     WATCHLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
     WATCHLIST_PATH.write_text(json.dumps(payload, indent=2))
 
 
-def load_watchlist() -> tuple[dict[str, list[WatchSetup]], str | None]:
+def load_watchlist() -> tuple[dict[str, list[WatchSetup]], dict[str, dict], str | None]:
     if not WATCHLIST_PATH.exists():
-        return {}, None
+        return {}, {}, None
     try:
         data = json.loads(WATCHLIST_PATH.read_text())
     except json.JSONDecodeError:
-        return {}, None
-    # Force regenerate if the schema version doesn't match (the in-disk
-    # format may be missing new fields the watcher now depends on)
+        return {}, {}, None
     if data.get("schema_version") != WATCHLIST_SCHEMA_VERSION:
-        return {}, None
+        return {}, {}, None
     out: dict[str, list[WatchSetup]] = {}
     for tk, ws in (data.get("tickers") or {}).items():
         out[tk] = [WatchSetup.from_dict(w) for w in ws]
-    return out, data.get("generated_at")
+    meta = data.get("portfolio_meta") or {}
+    return out, meta, data.get("generated_at")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -640,14 +651,19 @@ def format_violent_move(
 
 
 def format_refresh_digest(
-    watchlist: dict[str, list[WatchSetup]], label: str, top_n: int = 6,
+    watchlist: dict[str, list[WatchSetup]],
+    portfolio_meta: dict[str, dict],
+    label: str, top_n: int = 6,
 ) -> str | None:
     """A 'state of the portfolio' digest sent at each (re)build: how many
-    tickers/levels are armed and the handful closest to firing, ranked by
-    distance from the build-time price to the trigger. Returns None if
-    there's nothing rankable (no prices)."""
-    n_tickers = len(watchlist)
+    tickers are armed (have level setups) vs monitored (full portfolio),
+    and the handful closest to firing, ranked by distance from build-time
+    price to the trigger. The 'monitored' count includes quiet tickers
+    that get violent-move coverage but no level alerts."""
+    n_armed = len(watchlist)
+    n_monitored = max(len(portfolio_meta), n_armed)
     n_levels = sum(len(v) for v in watchlist.values())
+    n_quiet = max(n_monitored - n_armed, 0)
 
     # Collapse touch twins (same ticker+kind+trigger) so a level isn't
     # listed twice; keep the closest representative per level.
@@ -668,9 +684,10 @@ def format_refresh_digest(
     if not rows:
         return None
     rows.sort(key=lambda x: x[0])
+    quiet_note = f" ({n_quiet} quiet, violent-move only)" if n_quiet else ""
     head = (
         f"<b>🔄 WATCHLIST · {label} REFRESH</b>\n"
-        f"<i>{n_tickers} tickers · {n_levels} levels armed</i>\n"
+        f"<i>{n_armed} of {n_monitored} tickers armed{quiet_note} · {n_levels} levels</i>\n"
         f"Closest to firing:"
     )
     body = "\n".join(
@@ -755,21 +772,33 @@ def seconds_until_open(now_utc: datetime) -> float:
 # Main loop
 # ─────────────────────────────────────────────────────────────
 
-def check_once(watchlist: dict[str, list[WatchSetup]]) -> int:
-    """One pass through every watched setup. Returns number of alerts sent."""
+def check_once(
+    watchlist: dict[str, list[WatchSetup]],
+    portfolio_meta: dict[str, dict] | None = None,
+) -> int:
+    """One pass per portfolio ticker. Returns alerts sent.
+
+    Two independent alert paths run per ticker:
+      • Level-cross: only for tickers with armed setups (watchlist entries)
+      • Violent-move: runs on EVERY portfolio ticker (uses portfolio_meta
+        for avg_5m_vol), so a vertical bar on a 'quiet' name still pings."""
     state = load_state()
     already = set(state.get("alerted", []))
     sent = 0
     today_et = datetime.now(ET).strftime("%Y-%m-%d")
+    portfolio_meta = portfolio_meta or {}
 
-    for ticker, setups in watchlist.items():
-        if not setups:
-            continue
-        # Pre-compute violent-move dedup key. If all level-cross alerts AND
-        # both violent-move directions are already alerted, skip the fetch.
+    # Iterate every monitored ticker (union of watchlist + portfolio_meta).
+    # Quiet tickers (no setups) only do the violent-move check.
+    all_tickers = sorted(set(watchlist) | set(portfolio_meta))
+
+    for ticker in all_tickers:
+        setups = watchlist.get(ticker) or []
+        meta = portfolio_meta.get(ticker) or {}
+
         vm_up_key   = f"{ticker}|VIOLENT_MOVE|UP|{today_et}"
         vm_down_key = f"{ticker}|VIOLENT_MOVE|DOWN|{today_et}"
-        levels_done = all(alert_key(ticker, s, today_et) in already for s in setups)
+        levels_done = (not setups) or all(alert_key(ticker, s, today_et) in already for s in setups)
         vm_done = vm_up_key in already and vm_down_key in already
         if levels_done and vm_done:
             continue
@@ -781,7 +810,9 @@ def check_once(watchlist: dict[str, list[WatchSetup]]) -> int:
             continue
         bar = bars[0]
         prev_close = float(bars[1]["close"]) if len(bars) >= 2 else None
-        avg_5m_vol = setups[0].avg_5m_vol if setups else 0.0
+        # Prefer the per-setup stamp (more recent if setups exist), fall
+        # back to portfolio_meta for quiet tickers.
+        avg_5m_vol = setups[0].avg_5m_vol if setups else float(meta.get("avg_5m_vol") or 0.0)
 
         # ── Level-cross alerts ─────────────────────────────────────────
         for s in setups:
@@ -823,9 +854,11 @@ def check_once(watchlist: dict[str, list[WatchSetup]]) -> int:
     return sent
 
 
-def ensure_today_watchlist(portfolio: list[str]) -> dict[str, list[WatchSetup]]:
+def ensure_today_watchlist(
+    portfolio: list[str],
+) -> tuple[dict[str, list[WatchSetup]], dict[str, dict]]:
     """Load the persisted watchlist; regenerate it if missing or stale."""
-    watchlist, generated_at = load_watchlist()
+    watchlist, meta, generated_at = load_watchlist()
     today_et = datetime.now(ET).date().isoformat()
     fresh = False
     if generated_at:
@@ -835,21 +868,23 @@ def ensure_today_watchlist(portfolio: list[str]) -> dict[str, list[WatchSetup]]:
         except ValueError:
             fresh = False
     if not fresh or not watchlist:
-        watchlist = build_watchlist(portfolio)
-        save_watchlist(watchlist)
-        print(f"[watchlist] generated {sum(len(v) for v in watchlist.values())} levels across {len(watchlist)} tickers")
+        watchlist, meta = build_watchlist(portfolio)
+        save_watchlist(watchlist, meta)
+        print(f"[watchlist] generated {sum(len(v) for v in watchlist.values())} levels across {len(watchlist)} armed of {len(meta)} monitored")
     else:
         n_levels = sum(len(v) for v in watchlist.values())
-        print(f"[watchlist] using cached: {n_levels} levels across {len(watchlist)} tickers")
-    return watchlist
+        print(f"[watchlist] using cached: {n_levels} levels across {len(watchlist)} armed of {len(meta)} monitored")
+    return watchlist, meta
 
 
-def _force_rebuild_watchlist(portfolio: list[str]) -> dict[str, list[WatchSetup]]:
+def _force_rebuild_watchlist(
+    portfolio: list[str],
+) -> tuple[dict[str, list[WatchSetup]], dict[str, dict]]:
     print("[watchlist] mid-day rebuild — re-scanning to catch newly-formed setups")
-    watchlist = build_watchlist(portfolio)
-    save_watchlist(watchlist)
-    print(f"[watchlist] rebuilt: {sum(len(v) for v in watchlist.values())} levels across {len(watchlist)} tickers")
-    return watchlist
+    watchlist, meta = build_watchlist(portfolio)
+    save_watchlist(watchlist, meta)
+    print(f"[watchlist] rebuilt: {sum(len(v) for v in watchlist.values())} levels across {len(watchlist)} armed of {len(meta)} monitored")
+    return watchlist, meta
 
 
 def main_loop() -> int:
@@ -860,11 +895,12 @@ def main_loop() -> int:
     print(f"[start] intraday watcher | poll {POLL_SEC}s | portfolio: {portfolio}")
 
     watchlist: dict[str, list[WatchSetup]] = {}
+    portfolio_meta: dict[str, dict] = {}
     rebuilt_hours_today: set[int] = set()
     digests_sent_today: set[str] = set()
 
     def _send_digest(label: str) -> None:
-        msg = format_refresh_digest(watchlist, label)
+        msg = format_refresh_digest(watchlist, portfolio_meta, label)
         if msg and _send_telegram(msg):
             print(f"[digest] sent {label} refresh digest")
 
@@ -888,7 +924,7 @@ def main_loop() -> int:
             if state == "opening_skip":
                 # Pre-build today's watchlist while we wait through the noisy open
                 if not watchlist:
-                    watchlist = ensure_today_watchlist(portfolio)
+                    watchlist, portfolio_meta = ensure_today_watchlist(portfolio)
                 # Morning "here's the day's board" digest — once per day
                 dk = f"{today_key}|OPEN"
                 if watchlist and dk not in digests_sent_today:
@@ -898,7 +934,7 @@ def main_loop() -> int:
                 continue
 
             # state == "open"
-            watchlist = ensure_today_watchlist(portfolio)
+            watchlist, portfolio_meta = ensure_today_watchlist(portfolio)
 
             # Cover the case where the watcher first comes up after the
             # opening-skip window (deploy mid-session): still send the
@@ -914,7 +950,7 @@ def main_loop() -> int:
             now_et = now.astimezone(ET)
             for hr in MIDDAY_REBUILD_HOURS:
                 if now_et.hour == hr and hr not in rebuilt_hours_today:
-                    watchlist = _force_rebuild_watchlist(portfolio)
+                    watchlist, portfolio_meta = _force_rebuild_watchlist(portfolio)
                     rebuilt_hours_today.add(hr)
                     dk_mid = f"{today_key}|{hr}"
                     if dk_mid not in digests_sent_today:
@@ -922,7 +958,7 @@ def main_loop() -> int:
                         digests_sent_today.add(dk_mid)
                     break
 
-            sent = check_once(watchlist)
+            sent = check_once(watchlist, portfolio_meta)
             if sent == 0:
                 print(f"[tick] {now_et.strftime('%H:%M:%S ET')} — no crosses")
             time.sleep(POLL_SEC)
@@ -940,8 +976,8 @@ def main() -> int:
         if not portfolio:
             print("[fatal] no portfolio configured", file=sys.stderr)
             return 1
-        watchlist = ensure_today_watchlist(portfolio)
-        sent = check_once(watchlist)
+        watchlist, portfolio_meta = ensure_today_watchlist(portfolio)
+        sent = check_once(watchlist, portfolio_meta)
         print(f"[done] {sent} alert(s) sent")
         return 0
     return main_loop()
