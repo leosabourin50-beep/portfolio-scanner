@@ -346,7 +346,14 @@ def _handle_update(upd: dict, notifier) -> None:
 # Long-poll loop (runs in a daemon thread)
 # ─────────────────────────────────────────────────────────────
 
-def run_command_loop(notifier, poll_timeout: int = 50) -> None:
+# Transient long-poll hiccups — the held-open HTTPS connection gets cut by the
+# network/server. Benign: retry quietly. (urllib lacks requests' connection
+# resilience, so these surface as exceptions.)
+_BENIGN_POLL_ERRORS = ("UNEXPECTED_EOF", "EOF occurred", "timed out",
+                       "Connection reset", "Remote end closed", "Temporary failure")
+
+
+def run_command_loop(notifier, poll_timeout: int = 30) -> None:
     token = getattr(notifier, "token", None)
     if not token:
         print("[commands] no token — command loop not started", file=sys.stderr)
@@ -357,8 +364,13 @@ def run_command_loop(notifier, poll_timeout: int = 50) -> None:
         try:
             updates = _get_updates(token, offset, poll_timeout)
         except Exception as e:  # noqa: BLE001
-            print(f"[commands] getUpdates error: {e}", file=sys.stderr)
-            time.sleep(5)
+            # A dropped long-poll connection just means "no updates" — retry
+            # quietly. Only surface genuinely unexpected errors.
+            if any(s in str(e) for s in _BENIGN_POLL_ERRORS):
+                time.sleep(2)
+            else:
+                print(f"[commands] getUpdates error: {e}", file=sys.stderr)
+                time.sleep(5)
             continue
         for upd in updates:
             offset = max(offset, int(upd.get("update_id", 0)) + 1)

@@ -1,22 +1,19 @@
 """Render an analyzer result into a PNG chart for Telegram alerts.
 
-Self-contained on purpose: it does NOT import `app.py` (a Streamlit module
-that pulls in the whole UI), so the Fly worker and the GitHub Actions cron can
-render a chart without importing Streamlit. The styling mirrors the
-single-name-screener daily chart (phosphor/amber/cyan on near-black) so an
-alert chart looks like the app.
+Uses **matplotlib (Agg backend)** — no browser, no Chromium, no kaleido. A
+single render is ~50ms and a few tens of MB, so it runs comfortably on the
+512MB Fly watcher VM (kaleido's headless Chromium OOM-killed it). The styling
+mirrors the single-name-screener daily chart (phosphor/amber/cyan on
+near-black) so an alert chart looks like the app.
 
-Charts are a best-effort enhancement: `render_daily_png` returns None on ANY
-failure (missing data, kaleido not installed / broken in the container, etc.)
-and the caller falls back to a plain-text alert. It must never raise.
-
-PNG export needs `kaleido` (added to requirements.txt). kaleido is imported
-lazily by plotly only at `to_image` time, so importing this module never fails
-even if kaleido is absent.
+Self-contained: does NOT import `app.py` (Streamlit). Charts are best-effort —
+`render_daily_png` returns None on ANY failure and never raises, so the caller
+falls back to a plain-text alert.
 """
 from __future__ import annotations
 
-import math
+import io
+import sys
 
 # Mirror the app's terminal palette.
 BG_0 = "#050608"
@@ -25,12 +22,11 @@ TEXT_2 = "#5b6470"
 AMBER = "#ffb000"
 CYAN = "#00d9ff"
 PHOSPHOR = "#00ff8c"
-LIME = "#9aff5a"
 WARN = "#ff3b3b"
-GRID = "rgba(255,255,255,0.05)"
+GRID = "#161a20"
+MA_COLORS = {20: "#3b82f6", 50: "#f97316", 200: "#ef4444"}
 
-# Default alert chart window: ~8 months of trading days reads well on a phone,
-# unlike the app's full 2-year view.
+# Default alert chart window: ~8 months of trading days reads well on a phone.
 DEFAULT_SHOW_DAYS = 170
 
 
@@ -57,14 +53,17 @@ def render_daily_png(
         result:    an analyze_ticker() result dict (needs df_daily).
         cfg:       optional config (for log-scale thresholds); defaults applied.
         highlight: optional {"price": float, "label": str, "direction": str}
-                   — the level that fired, drawn as a bold line + annotation.
+                   — the level that fired, drawn as a bold line + label.
         title:     optional chart title; defaults to "TICKER — headline".
 
     Returns PNG bytes, or None on any failure.
     """
+    fig = None
     try:
-        import plotly.graph_objects as go
-        from plotly.subplots import make_subplots
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import numpy as np
         import pandas as pd
 
         df = result.get("df_daily")
@@ -74,115 +73,106 @@ def render_daily_png(
         chart_cfg = (cfg or {}).get("chart", {}) if cfg else {}
         show_days = int(chart_cfg.get("alert_show_days", show_days) or show_days)
         df_view = df.iloc[-show_days:].copy()
+        n = len(df_view)
         ticker = result.get("ticker", "")
+        x = np.arange(n)
 
-        fig = make_subplots(
-            rows=2, cols=1, shared_xaxes=True,
-            row_heights=[0.78, 0.22], vertical_spacing=0.03,
+        o = df_view["Open"].to_numpy(dtype=float)
+        h = df_view["High"].to_numpy(dtype=float)
+        low = df_view["Low"].to_numpy(dtype=float)
+        c = df_view["Close"].to_numpy(dtype=float)
+        vol = df_view["Volume"].to_numpy(dtype=float)
+        up = c >= o
+        colors = np.where(up, PHOSPHOR, WARN)
+
+        dpi = 110
+        fig, (ax, axv) = plt.subplots(
+            2, 1, sharex=True, figsize=(width / dpi, height / dpi), dpi=dpi,
+            gridspec_kw={"height_ratios": [3.6, 1], "hspace": 0.04},
         )
+        fig.patch.set_facecolor(BG_0)
 
-        fig.add_trace(
-            go.Candlestick(
-                x=df_view.index, open=df_view["Open"], high=df_view["High"],
-                low=df_view["Low"], close=df_view["Close"], name=ticker,
-                increasing_line_color=PHOSPHOR, decreasing_line_color=WARN,
-                increasing_fillcolor=PHOSPHOR, decreasing_fillcolor=WARN,
-                showlegend=False,
-            ),
-            row=1, col=1,
-        )
+        # Candlesticks: wicks via vlines, bodies via bars (vectorized, no loop).
+        ax.vlines(x, low, h, color=colors, linewidth=0.7)
+        body_bottom = np.minimum(o, c)
+        body_h = np.abs(c - o)
+        # Give doji bars a hair of height so they're visible.
+        body_h = np.where(body_h < (h - low) * 0.02 + 1e-9, (h - low) * 0.05 + 1e-9, body_h)
+        ax.bar(x, body_h, bottom=body_bottom, width=0.7, color=colors, linewidth=0)
 
-        ma_colors = {20: "#3b82f6", 50: "#f97316", 200: "#ef4444"}
+        # Moving averages (computed on full history, sliced to the view).
         for period in (20, 50, 200):
             if len(df) < period:
                 continue
-            ma = df["Close"].rolling(period).mean().iloc[-show_days:]
-            fig.add_trace(
-                go.Scatter(
-                    x=ma.index, y=ma.values, mode="lines",
-                    name=f"MA{period}",
-                    line=dict(color=ma_colors[period], width=1.1),
-                ),
-                row=1, col=1,
-            )
+            ma = df["Close"].rolling(period).mean().to_numpy(dtype=float)[-n:]
+            ax.plot(x, ma, color=MA_COLORS[period], linewidth=1.0, label=f"MA{period}")
 
-        candle_low = float(df_view["Low"].min())
-        candle_high = float(df_view["High"].max())
-        y_pad_lo = candle_low * 0.96
-        y_pad_hi = candle_high * 1.04
+        candle_low = float(np.nanmin(low))
+        candle_high = float(np.nanmax(h))
+        y_lo = candle_low * 0.96
+        y_hi = candle_high * 1.04
 
         # Emphasize the level that triggered the alert.
         hl_price = _safe_float((highlight or {}).get("price")) if highlight else 0.0
         if highlight and hl_price > 0:
             direction = (highlight.get("direction") or "").upper()
-            color = PHOSPHOR if direction == "BREAKOUT" else (
+            hl_color = PHOSPHOR if direction == "BREAKOUT" else (
                 WARN if direction == "BREAKDOWN" else AMBER)
             label = (highlight.get("label") or "LEVEL").upper()
-            # Make sure the level is in frame even if price ran away from it.
-            y_pad_lo = min(y_pad_lo, hl_price * 0.98)
-            y_pad_hi = max(y_pad_hi, hl_price * 1.02)
-            fig.add_hline(
-                y=hl_price, line=dict(color=color, width=1.8, dash="solid"),
-                annotation_text=f"${hl_price:.2f} {label}",
-                annotation_position="top left",
-                annotation_font=dict(color=color, size=12, family="JetBrains Mono"),
-                row=1, col=1,
-            )
+            y_lo = min(y_lo, hl_price * 0.98)
+            y_hi = max(y_hi, hl_price * 1.02)
+            ax.axhline(hl_price, color=hl_color, linewidth=1.7)
+            ax.text(0.4, hl_price, f"  ${hl_price:.2f} {label}", color=hl_color,
+                    fontsize=9, fontfamily="monospace", va="bottom", ha="left")
+
+        # Log scale when the visible range is wide.
+        thr = chart_cfg.get("log_scale_threshold_pct", 50)
+        if chart_cfg.get("auto_log_scale", True) and candle_low > 0 and \
+                (candle_high - candle_low) / candle_low * 100 >= thr:
+            ax.set_yscale("log")
+        ax.set_ylim(y_lo, y_hi)
 
         # Volume row, colored by up/down close.
-        vol_colors = [PHOSPHOR if c >= o else WARN
-                      for o, c in zip(df_view["Open"], df_view["Close"])]
-        fig.add_trace(
-            go.Bar(x=df_view.index, y=df_view["Volume"], marker_color=vol_colors,
-                   name="Volume", showlegend=False, opacity=0.5),
-            row=2, col=1,
-        )
+        axv.bar(x, vol, width=0.8, color=colors, linewidth=0, alpha=0.55)
 
         # Title.
         headline = result.get("headline") or {}
         if title is None:
             ht = headline.get("title") or ""
             title = f"{ticker} — {ht}" if ht else ticker
+        ax.set_title(title, color=TEXT_1, loc="left", fontsize=12,
+                     fontfamily="monospace", pad=8)
 
-        fig.update_layout(
-            title=dict(text=title, font=dict(family="JetBrains Mono", color=TEXT_1, size=14), x=0.02),
-            height=height, width=width, template="plotly_dark",
-            paper_bgcolor=BG_0, plot_bgcolor=BG_0,
-            font=dict(family="JetBrains Mono", color=TEXT_1, size=11),
-            margin=dict(l=10, r=10, t=44, b=10),
-            xaxis_rangeslider_visible=False,
-            showlegend=False,
-        )
+        # X tick labels: a handful of evenly-spaced dates (positional x means
+        # no weekend/holiday gaps).
+        if n:
+            ticks = np.linspace(0, n - 1, min(7, n), dtype=int)
+            axv.set_xticks(ticks)
+            axv.set_xticklabels([df_view.index[i].strftime("%b %y") for i in ticks])
+            ax.set_xlim(-1, n)
 
-        # Collapse weekend / holiday gaps so candles are contiguous.
-        try:
-            visible = pd.DatetimeIndex([ts.normalize() for ts in df_view.index]).unique()
-            rangebreaks = [dict(bounds=["sat", "mon"])]
-            if len(visible):
-                full = pd.bdate_range(visible.min(), visible.max())
-                missing = sorted(set(full) - set(visible))
-                if missing:
-                    rangebreaks.append(dict(values=[d.strftime("%Y-%m-%d") for d in missing]))
-            fig.update_xaxes(rangebreaks=rangebreaks)
-        except Exception:
-            pass
+        # Dark terminal styling for both axes.
+        for a in (ax, axv):
+            a.set_facecolor(BG_0)
+            a.grid(True, color=GRID, linewidth=0.5)
+            a.tick_params(colors=TEXT_1, labelsize=8)
+            for spine in a.spines.values():
+                spine.set_color(TEXT_2)
+                spine.set_linewidth(0.5)
+        # Upper-right keeps the legend clear of the (left-anchored) trigger label.
+        ax.legend(loc="upper right", fontsize=7, facecolor=BG_0,
+                  edgecolor=TEXT_2, labelcolor=TEXT_1, framealpha=0.5)
 
-        # Log scale when the visible range is wide.
-        use_log = False
-        thr = chart_cfg.get("log_scale_threshold_pct", 50)
-        if chart_cfg.get("auto_log_scale", True) and candle_low > 0:
-            if (candle_high - candle_low) / candle_low * 100 >= thr:
-                use_log = True
-        if use_log and y_pad_lo > 0:
-            fig.update_yaxes(type="log", range=[math.log10(y_pad_lo), math.log10(y_pad_hi)],
-                             row=1, col=1, gridcolor=GRID)
-        else:
-            fig.update_yaxes(range=[y_pad_lo, y_pad_hi], row=1, col=1, gridcolor=GRID)
-        fig.update_yaxes(gridcolor=GRID, row=2, col=1)
-        fig.update_xaxes(gridcolor=GRID)
-
-        return fig.to_image(format="png", width=width, height=height, scale=2)
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", facecolor=BG_0, bbox_inches="tight")
+        return buf.getvalue()
     except Exception as e:  # noqa: BLE001 — charts must never break an alert
-        import sys
         print(f"[warn] chart render failed: {e}", file=sys.stderr)
         return None
+    finally:
+        if fig is not None:
+            try:
+                import matplotlib.pyplot as plt
+                plt.close(fig)
+            except Exception:
+                pass
