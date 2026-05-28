@@ -5,8 +5,10 @@ runs as a daemon thread inside `intraday_watcher.py` because that is the only
 always-on process — GitHub Actions cron is ephemeral and can't hold a
 long-poll, and Telegram allows only ONE getUpdates consumer per token.
 
-Authorized to the configured chat id only: messages from anyone else are
-ignored.
+Authorized senders only: the alert chat (TELEGRAM_WATCHER_CHAT_ID /
+TELEGRAM_CHAT_ID) plus any ids in TELEGRAM_OWNER_ID (comma/space list). Set
+TELEGRAM_OWNER_ID to your Telegram user id to DM commands while alerts post to
+a separate channel. Everyone else is ignored.
 
 Commands:
   /help                       this list
@@ -319,15 +321,31 @@ _COMMANDS = {
 }
 
 
+def _allowed_ids(notifier) -> set[str]:
+    """IDs allowed to command the bot: TELEGRAM_OWNER_ID (comma/space list) plus
+    the notifier's chat. Setting TELEGRAM_OWNER_ID to your user id lets you DM
+    commands even when alerts post to a different chat (e.g. a channel)."""
+    allowed: set[str] = set()
+    for tok in os.environ.get("TELEGRAM_OWNER_ID", "").replace(",", " ").split():
+        if tok.strip():
+            allowed.add(tok.strip())
+    if notifier.chat_id:
+        allowed.add(str(notifier.chat_id))
+    return allowed
+
+
 def _handle_update(upd: dict, notifier) -> None:
     msg = upd.get("message") or {}
     text = (msg.get("text") or "").strip()
     chat = msg.get("chat") or {}
     chat_id = str(chat.get("id", ""))
+    sender_id = str((msg.get("from") or {}).get("id", ""))
 
-    # Authorize: only the configured chat may drive the bot.
-    if notifier.chat_id and chat_id != str(notifier.chat_id):
-        print(f"[commands] ignoring message from unauthorized chat {chat_id}", file=sys.stderr)
+    # Authorize on EITHER the chat (alert channel) or the sender (owner DM).
+    allowed = _allowed_ids(notifier)
+    if allowed and chat_id not in allowed and sender_id not in allowed:
+        print(f"[commands] ignoring unauthorized chat {chat_id} (sender {sender_id})",
+              file=sys.stderr)
         return
     if not text.startswith("/"):
         return
