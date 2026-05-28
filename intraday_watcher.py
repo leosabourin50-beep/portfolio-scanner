@@ -17,16 +17,22 @@ Signal-quality filters (keep the bot quiet, not noisy):
   • One alert per (ticker, kind, trigger, date) — first cross only
 
 Required env vars:
-  POLYGON_API_KEY     — Polygon Stocks Starter or higher
-  TELEGRAM_BOT_TOKEN  — same bot as the daily cron
-  TELEGRAM_CHAT_ID    — your chat id
+  POLYGON_API_KEY          — Polygon Stocks Starter or higher
+  TELEGRAM_WATCHER_BOT_TOKEN — the watcher's bot (separate from the cron bot;
+                             falls back to TELEGRAM_BOT_TOKEN if unset)
+  TELEGRAM_WATCHER_CHAT_ID — chat id (falls back to TELEGRAM_CHAT_ID)
 
 Optional env vars:
   WATCHER_POLL_SEC    — seconds between iterations (default 60)
   WATCHLIST_PATH      — where the per-day watchlist JSON lives (default /data/intraday_watchlist.json on Fly, .intraday_watchlist.json locally)
   ALERTS_STATE_PATH   — dedup state file (default /data/intraday_alerts_state.json on Fly, .intraday_alerts_state.json locally)
+  ALERT_LOG_PATH      — JSONL alert log the weekly scorecard reads (default /data/alert_log.jsonl)
+  HEARTBEAT_PATH      — liveness file touched each poll (default /data/heartbeat.txt)
   DRY_RUN             — "1" to print messages instead of sending
   PER_TICKER_LIMIT    — max watched setups per ticker (default 3)
+  USE_SNAPSHOT        — "1" (default) to use the one-call snapshot pre-filter
+  PREFILTER_PROX_PCT  — % distance to a level that keeps a ticker "in play" (default 2.0)
+  DISABLE_COMMAND_BOT — "1" to skip the interactive Telegram command handler
 """
 from __future__ import annotations
 
@@ -35,8 +41,6 @@ import os
 import sys
 import time
 import traceback
-import urllib.parse
-import urllib.request
 from dataclasses import dataclass, asdict, field, replace
 from datetime import datetime, time as dtime, timedelta, timezone
 from pathlib import Path
@@ -44,7 +48,10 @@ from zoneinfo import ZoneInfo
 
 import portfolio_scanner as ps
 import single_name_analyzer as sna
-from polygon_adapter import get_client
+import portfolio as pf
+import notify
+import chart_render
+from polygon_adapter import get_client, get_snapshot_all
 
 
 # ─────────────────────────────────────────────────────────────
@@ -67,8 +74,69 @@ VIOLENT_MOVE_VOL_MULT = float(os.environ.get("VIOLENT_MOVE_VOL_MULT", "2.5"))
 _DATA_DIR = Path("/data") if Path("/data").is_dir() else Path(".")
 WATCHLIST_PATH = Path(os.environ.get("WATCHLIST_PATH", _DATA_DIR / "intraday_watchlist.json"))
 ALERTS_STATE_PATH = Path(os.environ.get("ALERTS_STATE_PATH", _DATA_DIR / "intraday_alerts_state.json"))
+ALERT_LOG_PATH = Path(os.environ.get("ALERT_LOG_PATH", _DATA_DIR / "alert_log.jsonl"))
+HEARTBEAT_PATH = Path(os.environ.get("HEARTBEAT_PATH", _DATA_DIR / "heartbeat.txt"))
+
+# Snapshot pre-filter: one grouped snapshot call per poll provides every
+# ticker's price/volume; 5-min bars are then fetched ONLY for names "in play"
+# (near an armed level, big day move, or a minute-volume spike). Collapses the
+# common case (names sitting quietly far from any level) from N calls to ~1.
+USE_SNAPSHOT = os.environ.get("USE_SNAPSHOT", "1") == "1"
+PREFILTER_PROX_PCT = float(os.environ.get("PREFILTER_PROX_PCT", "2.0"))
 
 PORTFOLIO_FILE = Path("portfolio.txt")
+
+# The watcher runs on its OWN Telegram bot (separate token from the daily
+# cron). Falls back to TELEGRAM_BOT_TOKEN/CHAT_ID if the watcher-specific vars
+# aren't set, so single-token setups keep working.
+NOTIFIER = notify.Notifier.from_env("TELEGRAM_WATCHER_BOT_TOKEN", "TELEGRAM_WATCHER_CHAT_ID")
+
+_CFG: dict | None = None
+
+
+def _cfg() -> dict:
+    """Lazily-loaded analyzer config (used for on-demand chart rendering)."""
+    global _CFG
+    if _CFG is None:
+        _CFG = sna.load_config()
+    return _CFG
+
+
+def _chart_for(ticker: str, highlight: dict | None) -> bytes | None:
+    """Render the daily chart for an alert, with the firing level emphasized.
+    Runs a fresh analyze_ticker (alerts are infrequent, so the extra call is
+    cheap) to get df_daily. Best-effort — returns None on any failure so the
+    alert still goes out as text."""
+    try:
+        result = sna.analyze_ticker(ticker, cfg=_cfg())
+        return chart_render.render_daily_png(result, _cfg(), highlight=highlight)
+    except Exception as e:  # noqa: BLE001
+        print(f"[warn] chart render for {ticker} failed: {e}", file=sys.stderr)
+        return None
+
+
+def _write_heartbeat() -> None:
+    """Touch a heartbeat file each poll so a dead loop is externally
+    detectable (e.g. file mtime age) even if the process appears up."""
+    try:
+        HEARTBEAT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        HEARTBEAT_PATH.write_text(datetime.now(timezone.utc).isoformat())
+    except OSError:
+        pass
+
+
+def _log_alert(ticker: str, kind: str, direction: str, trigger: float | None,
+               price: float | None, source: str) -> None:
+    notify.append_jsonl(ALERT_LOG_PATH, {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "source": source,
+        "ticker": ticker,
+        "kind": kind,
+        "direction": direction,
+        "trigger": round(trigger, 4) if trigger else None,
+        "price_at_alert": round(price, 4) if price else None,
+        "trading_date": datetime.now(ET).strftime("%Y-%m-%d"),
+    })
 
 # Bump when the watchlist schema changes so cached files get regenerated
 # on deploy instead of sticking around until the next trading day.
@@ -191,13 +259,9 @@ class WatchSetup:
 # ─────────────────────────────────────────────────────────────
 
 def load_portfolio() -> list[str]:
-    env = os.environ.get("SCAN_PORTFOLIO", "").strip()
-    if env:
-        return [t.strip().upper() for t in env.replace(",", " ").split() if t.strip()]
-    if PORTFOLIO_FILE.exists():
-        raw = PORTFOLIO_FILE.read_text()
-        return [t.strip().upper() for t in raw.replace(",", " ").split() if t.strip()]
-    return []
+    """Tickers from the shared portfolio module (positions-aware file format,
+    runtime file on the volume, SCAN_PORTFOLIO override)."""
+    return pf.load_portfolio()
 
 
 def _atr_from_result(result: dict) -> float:
@@ -576,39 +640,31 @@ def _volume_context(ticker: str, avg_5m_vol: float, bar: dict) -> str | None:
 # ─────────────────────────────────────────────────────────────
 
 def _send_telegram(text: str) -> bool:
-    """Return True iff the message was successfully delivered (or simulated
-    in DRY_RUN). False means the caller should NOT mark the alert as
-    delivered — so the next poll will retry it instead of silently deduping."""
-    if os.environ.get("DRY_RUN") == "1":
-        print("[DRY_RUN] would send:\n" + text + "\n---")
-        return True
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-    if not token or not chat_id:
-        print("[skip] TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set", file=sys.stderr)
-        return False
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = urllib.parse.urlencode({
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": "true",
-    }).encode()
-    try:
-        with urllib.request.urlopen(urllib.request.Request(url, data=payload), timeout=15) as resp:
-            body = resp.read()
-        # Telegram returns 200 with {"ok": true} on success
-        if b'"ok":true' in body:
-            return True
-        print(f"[error] Telegram send returned non-ok: {body[:200]!r}", file=sys.stderr)
-        return False
-    except Exception as e:
-        print(f"[error] Telegram send failed: {e}", file=sys.stderr)
-        return False
+    """Send a plain-text message via the watcher's bot. Thin wrapper around the
+    shared notifier so digests/heartbeats keep their existing call sites."""
+    return NOTIFIER.message(text)
+
+
+def _send_alert(text: str, png_bytes: bytes | None = None) -> bool:
+    """Send an alert with an optional chart image (falls back to text)."""
+    return NOTIFIER.alert(text, png_bytes=png_bytes)
+
+
+def _position_line(ticker: str, positions: dict, last_price: float) -> str | None:
+    """HELD line for an owned position, or None. Lets an intraday breakdown on
+    a name you HOLD read as a risk alert."""
+    pos = positions.get(ticker)
+    if pos is None or not pos.is_owned or not pos.entry or last_price <= 0:
+        return None
+    pl = (last_price / pos.entry - 1) * 100.0
+    sign = "+" if pl >= 0 else ""
+    return (f"📦 <b>HELD</b> {pos.shares:g} sh @ <code>${pos.entry:.2f}</code> "
+            f"· P/L {sign}{pl:.1f}%")
 
 
 def format_alert(ticker: str, setup: WatchSetup, bar: dict,
-                  vol_note: str | None = None) -> str:
+                  vol_note: str | None = None,
+                  position_line: str | None = None) -> str:
     bar_time_et = bar["ts"].astimezone(ET).strftime("%H:%M ET")
 
     # Special-case 52-week high / low — distinct trophy/down-trend formatting.
@@ -672,6 +728,8 @@ def format_alert(ticker: str, setup: WatchSetup, bar: dict,
         ]
         footer = f"5-min bar close · {bar_time_et}"
 
+    if position_line:
+        lines.append(position_line)
     if vol_note:
         lines.append(vol_note)
     lines.append(f"<i>{footer}</i>")
@@ -680,23 +738,21 @@ def format_alert(ticker: str, setup: WatchSetup, bar: dict,
 
 def format_violent_move(
     ticker: str, bar: dict, chg_pct: float, vol_mult: float,
+    position_line: str | None = None,
 ) -> str:
     """Big single-bar move alert — independent of any pre-curated level.
     Fires on vertical surges/drops the level watcher can't see."""
     bar_time_et = bar["ts"].astimezone(ET).strftime("%H:%M ET")
-    if chg_pct >= 0:
-        return "\n".join([
-            f"<b>🚀 VIOLENT MOVE UP — {ticker}</b>",
-            f"<code>${bar['close']:.2f}</code>  ({chg_pct:+.2f}% on the 5-min bar)",
-            f"📊 {vol_mult:.1f}× avg 5m volume",
-            f"<i>5-min bar close · {bar_time_et}</i>",
-        ])
-    return "\n".join([
-        f"<b>🔻 VIOLENT DROP — {ticker}</b>",
+    head = "🚀 VIOLENT MOVE UP" if chg_pct >= 0 else "🔻 VIOLENT DROP"
+    lines = [
+        f"<b>{head} — {ticker}</b>",
         f"<code>${bar['close']:.2f}</code>  ({chg_pct:+.2f}% on the 5-min bar)",
         f"📊 {vol_mult:.1f}× avg 5m volume",
-        f"<i>5-min bar close · {bar_time_et}</i>",
-    ])
+    ]
+    if position_line:
+        lines.append(position_line)
+    lines.append(f"<i>5-min bar close · {bar_time_et}</i>")
+    return "\n".join(lines)
 
 
 def format_refresh_digest(
@@ -824,6 +880,35 @@ def seconds_until_open(now_utc: datetime) -> float:
 # Main loop
 # ─────────────────────────────────────────────────────────────
 
+def _snapshot_in_play(snap_row: dict | None,
+                      setups: list[WatchSetup], meta: dict) -> bool:
+    """Decide whether a ticker needs a detailed 5-min fetch this poll, from its
+    one-shot snapshot. Conservative: returns True whenever uncertain, so the
+    pre-filter never silently drops a real signal."""
+    if not snap_row:
+        return True
+    last = snap_row.get("last")
+    # (a) within striking distance of an armed level
+    if last and last > 0:
+        for s in setups:
+            if s.trigger and abs(s.trigger - last) / last * 100.0 <= PREFILTER_PROX_PCT:
+                return True
+    # (b) large cumulative day move → violent-move candidate, always look
+    chg = snap_row.get("change_pct")
+    if chg is not None and abs(chg) >= VIOLENT_MOVE_PCT:
+        return True
+    # (c) minute-volume spike → a violent 5-min bar may be forming. Compare the
+    # snapshot's 1-min volume to a per-minute baseline (avg 5-min vol / 5), at
+    # 0.6× the violent threshold so we look slightly before it would fire.
+    avg5 = setups[0].avg_5m_vol if setups else float(meta.get("avg_5m_vol") or 0.0)
+    minv = snap_row.get("min_volume")
+    if avg5 and avg5 > 0 and minv:
+        per_min = avg5 / 5.0
+        if per_min > 0 and minv >= per_min * VIOLENT_MOVE_VOL_MULT * 0.6:
+            return True
+    return False
+
+
 def check_once(
     watchlist: dict[str, list[WatchSetup]],
     portfolio_meta: dict[str, dict] | None = None,
@@ -839,12 +924,24 @@ def check_once(
     sent = 0
     today_et = datetime.now(ET).strftime("%Y-%m-%d")
     portfolio_meta = portfolio_meta or {}
+    positions = pf.positions_map()
 
     # Iterate every monitored ticker (union of watchlist + portfolio_meta).
     # Quiet tickers (no setups) only do the violent-move check.
     all_tickers = sorted(set(watchlist) | set(portfolio_meta))
 
+    # One grouped snapshot call powers the pre-filter (see USE_SNAPSHOT). If it
+    # comes back empty (plan without snapshot access, transient error) we fall
+    # back to scanning every ticker the original per-ticker way.
+    snap = get_snapshot_all(all_tickers) if USE_SNAPSHOT else {}
+    examined = skipped = 0
+
     for ticker in all_tickers:
+        # Muted/snoozed names are skipped entirely (set via Telegram /mute,
+        # /snooze). Expired snoozes auto-clear in portfolio.load_mutes().
+        if pf.is_muted(ticker):
+            continue
+
         setups = watchlist.get(ticker) or []
         meta = portfolio_meta.get(ticker) or {}
 
@@ -854,6 +951,14 @@ def check_once(
         vm_done = vm_up_key in already and vm_down_key in already
         if levels_done and vm_done:
             continue
+
+        # Snapshot pre-filter: skip the 5-min fetch for names that are far
+        # from any armed level and not moving. Conservative — when in doubt
+        # (no snapshot row) it still fetches.
+        if snap and not _snapshot_in_play(snap.get(ticker), setups, meta):
+            skipped += 1
+            continue
+        examined += 1
 
         # One fetch per ticker — bars[0] is the latest, bars[1] is the
         # prior bar (used as the baseline for violent-move % change).
@@ -865,6 +970,7 @@ def check_once(
         # Prefer the per-setup stamp (more recent if setups exist), fall
         # back to portfolio_meta for quiet tickers.
         avg_5m_vol = setups[0].avg_5m_vol if setups else float(meta.get("avg_5m_vol") or 0.0)
+        pos_line = _position_line(ticker, positions, bar["close"])
 
         # ── Level-cross alerts ─────────────────────────────────────────
         for s in setups:
@@ -873,9 +979,15 @@ def check_once(
                 continue
             if is_cross(bar, s):
                 vol_note = _volume_context(ticker, s.avg_5m_vol, bar)
-                if _send_telegram(format_alert(ticker, s, bar, vol_note)):
+                png = _chart_for(ticker, {
+                    "price": s.trigger, "label": s.label, "direction": s.direction,
+                })
+                msg = format_alert(ticker, s, bar, vol_note, position_line=pos_line)
+                if _send_alert(msg, png):
                     already.add(key)
                     sent += 1
+                    _log_alert(ticker, s.kind, s.direction, s.trigger,
+                               bar["close"], "watcher_level")
                     print(f"[alert] {ticker} {s.direction} {s.kind} @ ${s.trigger:.2f}")
                 else:
                     print(
@@ -890,15 +1002,24 @@ def check_once(
             if abs(chg_pct) >= VIOLENT_MOVE_PCT and vol_mult >= VIOLENT_MOVE_VOL_MULT:
                 vm_key = vm_up_key if chg_pct > 0 else vm_down_key
                 if vm_key not in already:
-                    if _send_telegram(format_violent_move(ticker, bar, chg_pct, vol_mult)):
+                    png = _chart_for(ticker, None)
+                    msg = format_violent_move(ticker, bar, chg_pct, vol_mult,
+                                              position_line=pos_line)
+                    if _send_alert(msg, png):
                         already.add(vm_key)
                         sent += 1
+                        _log_alert(ticker, "VIOLENT_MOVE",
+                                   "BREAKOUT" if chg_pct > 0 else "BREAKDOWN",
+                                   None, bar["close"], "watcher_violent")
                         print(f"[alert] {ticker} VIOLENT_MOVE {chg_pct:+.2f}% on {vol_mult:.1f}× vol")
                     else:
                         print(
                             f"[retry] {ticker} violent-move delivery failed — will retry next poll",
                             file=sys.stderr,
                         )
+
+    if snap:
+        print(f"[snapshot] {examined} examined, {skipped} skipped of {len(all_tickers)} monitored")
 
     if sent:
         state["alerted"] = sorted(already)
@@ -939,6 +1060,56 @@ def _force_rebuild_watchlist(
     return watchlist, meta
 
 
+def _start_command_bot() -> None:
+    """Launch the interactive Telegram command handler in a daemon thread. It
+    long-polls the watcher's own bot (the always-on process is the only place
+    a getUpdates consumer can live). Failures here never take down the alert
+    loop. Set DISABLE_COMMAND_BOT=1 to turn it off."""
+    if os.environ.get("DISABLE_COMMAND_BOT") == "1":
+        print("[commands] disabled via DISABLE_COMMAND_BOT")
+        return
+    if not NOTIFIER.token:
+        print("[commands] no watcher bot token set — interactive commands off", file=sys.stderr)
+        return
+    try:
+        import threading
+        import telegram_commands
+        threading.Thread(
+            target=telegram_commands.run_command_loop,
+            kwargs={"notifier": NOTIFIER},
+            daemon=True, name="telegram-commands",
+        ).start()
+        print("[commands] interactive command bot started")
+    except Exception as e:  # noqa: BLE001
+        print(f"[commands] failed to start command bot: {e}", file=sys.stderr)
+
+
+def _send_eod_summary(alerts_today: int, portfolio_meta: dict, watchlist: dict) -> None:
+    """End-of-day liveness + activity ping. Its absence by ~16:05 ET is the
+    dead-man's-switch that the watcher died during the session."""
+    n_monitored = max(len(portfolio_meta), len(watchlist))
+    n_armed = len(watchlist)
+    plural = "s" if alerts_today != 1 else ""
+    msg = (
+        "<b>✅ WATCHER OK — session close</b>\n"
+        f"<i>{alerts_today} alert{plural} sent today · "
+        f"{n_armed} armed of {n_monitored} monitored</i>"
+    )
+    if _send_telegram(msg):
+        print(f"[eod] sent end-of-day summary ({alerts_today} alerts)")
+
+
+def _run_weekly_scorecard() -> None:
+    """Grade the week's alerts by forward return and send the digest."""
+    try:
+        import scorecard
+        msg = scorecard.weekly_scorecard(ALERT_LOG_PATH)
+        if msg and _send_telegram(msg):
+            print("[scorecard] sent weekly scorecard")
+    except Exception as e:  # noqa: BLE001
+        print(f"[scorecard] failed: {e}", file=sys.stderr)
+
+
 def main_loop() -> int:
     portfolio = load_portfolio()
     if not portfolio:
@@ -946,10 +1117,15 @@ def main_loop() -> int:
         return 1
     print(f"[start] intraday watcher | poll {POLL_SEC}s | portfolio: {portfolio}")
 
+    _start_command_bot()
+
     watchlist: dict[str, list[WatchSetup]] = {}
     portfolio_meta: dict[str, dict] = {}
     rebuilt_hours_today: set[int] = set()
     digests_sent_today: set[str] = set()
+    alerts_today = 0
+    last_eod_date: str | None = None
+    last_scorecard_week: str | None = None
 
     def _send_digest(label: str) -> None:
         msg = format_refresh_digest(watchlist, portfolio_meta, label)
@@ -959,9 +1135,25 @@ def main_loop() -> int:
     while True:
         try:
             now = datetime.now(timezone.utc)
+            now_et = now.astimezone(ET)
+            today_key = now_et.strftime("%Y-%m-%d")
             state = market_state(now)
+            _write_heartbeat()
 
             if state in ("weekend", "closed_weekday", "pre"):
+                # End-of-day wrap-up: once per weekday after the close. Proves
+                # the loop survived the whole session and reports the day's
+                # alert count; also fires the weekly scorecard on Fridays.
+                if state == "closed_weekday" and today_key != last_eod_date:
+                    _send_eod_summary(alerts_today, portfolio_meta, watchlist)
+                    last_eod_date = today_key
+                    alerts_today = 0
+                    iso = now_et.isocalendar()
+                    wk = f"{iso.year}-W{iso.week:02d}"
+                    if now_et.weekday() == 4 and wk != last_scorecard_week:
+                        _run_weekly_scorecard()
+                        last_scorecard_week = wk
+
                 wait = min(seconds_until_open(now), 3600)  # cap at 1 hour
                 print(f"[sleep] market state={state}, sleeping {int(wait)}s")
                 # New trading day starts after a sleep through the close — clear
@@ -970,8 +1162,6 @@ def main_loop() -> int:
                 digests_sent_today.clear()
                 time.sleep(max(wait, 60))
                 continue
-
-            today_key = datetime.now(ET).strftime("%Y-%m-%d")
 
             if state == "opening_skip":
                 # Pre-build today's watchlist while we wait through the noisy open
@@ -999,7 +1189,6 @@ def main_loop() -> int:
             # Mid-day rebuild: at the configured hours (12:00 ET, 14:00 ET) do
             # a fresh build so setups that only formed during the session get
             # picked up. Once per hour, dedup'd via rebuilt_hours_today.
-            now_et = now.astimezone(ET)
             for hr in MIDDAY_REBUILD_HOURS:
                 if now_et.hour == hr and hr not in rebuilt_hours_today:
                     watchlist, portfolio_meta = _force_rebuild_watchlist(portfolio)
@@ -1011,6 +1200,7 @@ def main_loop() -> int:
                     break
 
             sent = check_once(watchlist, portfolio_meta)
+            alerts_today += sent
             if sent == 0:
                 print(f"[tick] {now_et.strftime('%H:%M:%S ET')} — no crosses")
             time.sleep(POLL_SEC)

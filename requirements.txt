@@ -5,3 +5,7 @@ plotly>=5.18.0
 polygon-api-client>=1.13.0
 pyyaml>=6.0
 scipy>=1.11.0
+# Static PNG export for chart-bearing Telegram alerts. 0.2.1 bundles its own
+# headless chromium (works in the slim Docker image with no extra system deps).
+# Chart rendering is best-effort: if export fails, alerts fall back to text.
+kaleido==0.2.1

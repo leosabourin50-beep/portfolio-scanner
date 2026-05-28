@@ -12,7 +12,7 @@ SETUP:
 
 import os
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from polygon import RESTClient
 
 
@@ -155,3 +155,76 @@ def fetch_intraday(
     except Exception as e:
         print(f"[Polygon] Error fetching intraday {ticker}: {e}")
         return pd.DataFrame()
+
+
+def get_snapshot_all(tickers: list[str]) -> dict[str, dict]:
+    """One grouped snapshot call for the whole portfolio's current state.
+
+    Returns ticker -> {last, day_open, day_high, day_low, day_close,
+    day_volume, prev_close, change_pct, min_close, min_volume, min_ts}. The
+    intraday watcher uses this as a cheap per-poll pre-filter: instead of N
+    per-ticker 5-min fetches, it pulls every ticker's price/volume in one
+    request and only fetches 5-min bars for the names actually in play.
+
+    Returns {} on any failure (e.g. plan without snapshot access) so callers
+    fall back to the per-ticker path.
+    """
+    tickers = [t.strip().upper() for t in tickers if t and t.strip()]
+    if not tickers:
+        return {}
+    client = get_client()
+    try:
+        snaps = client.get_snapshot_all("stocks", tickers=tickers)
+    except Exception as e:
+        print(f"[Polygon] snapshot_all failed: {e}")
+        return {}
+
+    out: dict[str, dict] = {}
+    for s in snaps or []:
+        try:
+            tk = getattr(s, "ticker", None)
+            if not tk:
+                continue
+            day = getattr(s, "day", None)
+            minute = getattr(s, "min", None)
+            prev = getattr(s, "prev_day", None)
+            last_trade = getattr(s, "last_trade", None)
+
+            def _g(obj, *names):
+                for n in names:
+                    v = getattr(obj, n, None) if obj is not None else None
+                    if v is not None:
+                        try:
+                            return float(v)
+                        except (TypeError, ValueError):
+                            return None
+                return None
+
+            day_close = _g(day, "close")
+            min_close = _g(minute, "close")
+            last_px = _g(last_trade, "price", "p") or min_close or day_close
+            min_ts_raw = getattr(minute, "timestamp", None) if minute is not None else None
+            min_ts = None
+            if min_ts_raw:
+                try:
+                    # Polygon minute snapshot timestamps are ms since epoch.
+                    min_ts = datetime.fromtimestamp(float(min_ts_raw) / 1000.0, tz=timezone.utc)
+                except (TypeError, ValueError, OSError):
+                    min_ts = None
+
+            out[tk.upper()] = {
+                "last": last_px,
+                "day_open": _g(day, "open"),
+                "day_high": _g(day, "high"),
+                "day_low": _g(day, "low"),
+                "day_close": day_close,
+                "day_volume": _g(day, "volume"),
+                "prev_close": _g(prev, "close"),
+                "change_pct": _g(s, "todays_change_percent"),
+                "min_close": min_close,
+                "min_volume": _g(minute, "volume"),
+                "min_ts": min_ts,
+            }
+        except Exception:
+            continue
+    return out
