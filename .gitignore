@@ -18,3 +18,16 @@ Thumbs.db
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Runtime state (persisted on the Fly volume / actions cache, not in git)
+portfolio_runtime.txt
+mutes.json
+heartbeat.txt
+command_offset.txt
+alert_log.jsonl
+.alert_log.jsonl
+intraday_watchlist.json
+intraday_alerts_state.json
+.intraday_watchlist.json
+.intraday_alerts_state.json
+.alerts_state.json

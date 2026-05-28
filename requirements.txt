@@ -5,3 +5,8 @@ plotly>=5.18.0
 polygon-api-client>=1.13.0
 pyyaml>=6.0
 scipy>=1.11.0
+# Chart rendering for Telegram alerts. matplotlib (Agg) renders PNGs with no
+# browser — unlike Plotly's kaleido, which drives a headless Chromium that
+# OOM-kills the 512MB watcher VM. Best-effort: if rendering fails, alerts fall
+# back to text.
+matplotlib>=3.7

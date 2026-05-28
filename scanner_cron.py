@@ -28,19 +28,20 @@ from __future__ import annotations
 import json
 import os
 import sys
-import urllib.parse
-import urllib.request
 from datetime import datetime, time as dtime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import portfolio_scanner as ps
 import single_name_analyzer as sna
+import portfolio as pf
+import notify
+import chart_render
 
 
 DEFAULT_TIERS = ("FRESH_TRIGGER", "RECENT_TRIGGER", "IMMEDIATE_SETUP")
-PORTFOLIO_FILE = Path("portfolio.txt")
 STATE_FILE = Path(os.environ.get("ALERTS_STATE_PATH", ".alerts_state.json"))
+ALERT_LOG_FILE = Path(os.environ.get("ALERT_LOG_PATH", ".alert_log.jsonl"))
 
 # The GitHub Actions cron fires on a fixed UTC window (it can't do
 # timezones), so the script itself gates delivery to US market hours in
@@ -60,22 +61,7 @@ def within_market_hours(now_utc: datetime | None = None) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────
-# Portfolio loading
-# ─────────────────────────────────────────────────────────────
-
-def load_portfolio() -> list[str]:
-    """Env var override > portfolio.txt > empty."""
-    env = os.environ.get("SCAN_PORTFOLIO", "").strip()
-    if env:
-        return [t.strip().upper() for t in env.replace(",", " ").split() if t.strip()]
-    if PORTFOLIO_FILE.exists():
-        raw = PORTFOLIO_FILE.read_text()
-        return [t.strip().upper() for t in raw.replace(",", " ").split() if t.strip()]
-    return []
-
-
-# ─────────────────────────────────────────────────────────────
-# Dedup state (JSON file committed by the workflow)
+# Dedup state (persisted between runs via GitHub Actions cache)
 # ─────────────────────────────────────────────────────────────
 
 def load_state() -> dict:
@@ -108,57 +94,44 @@ def save_state(state: dict) -> None:
     STATE_FILE.write_text(json.dumps(state, indent=2))
 
 
+def _trading_date(read: ps.ActionableRead) -> str:
+    """Date of the last daily bar (so a weekend run reuses Friday's date and
+    doesn't re-alert). Falls back to today UTC."""
+    df = read.result.get("df_daily")
+    if df is not None and not df.empty:
+        return df.index[-1].strftime("%Y-%m-%d")
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
 def alert_key(read: ps.ActionableRead) -> str:
     """Stable dedup key. Date comes from the last daily bar so a Sunday
     run won't generate a new key vs Friday's run."""
-    last_bar = None
-    df = read.result.get("df_daily")
-    if df is not None and not df.empty:
-        last_bar = df.index[-1].strftime("%Y-%m-%d")
-    if last_bar is None:
-        last_bar = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    return f"{read.ticker}|{read.setup_kind or 'NEUTRAL'}|{last_bar}"
+    return f"{read.ticker}|{read.setup_kind or 'NEUTRAL'}|{_trading_date(read)}"
+
+
+def alert_record(read: ps.ActionableRead) -> dict:
+    """One row for the alert log the weekly scorecard grades."""
+    return {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "source": "cron",
+        "ticker": read.ticker,
+        "kind": read.setup_kind,
+        "direction": read.direction,
+        "tier": read.tier,
+        "trigger": round(read.trigger_price, 4) if read.trigger_price else None,
+        "price_at_alert": round(read.last_price, 4) if read.last_price else None,
+        "trading_date": _trading_date(read),
+    }
 
 
 # ─────────────────────────────────────────────────────────────
-# Telegram delivery
+# Message formatting
 # ─────────────────────────────────────────────────────────────
 
-def _send_telegram(text: str) -> bool:
-    """Return True iff the message was successfully delivered. Caller MUST
-    check the return and only mark an alert as deduped on True — otherwise
-    a failed Telegram send (bad token, network blip) silently dedupes the
-    alert forever and the user never sees the ping."""
-    if os.environ.get("DRY_RUN") == "1":
-        print("[DRY_RUN] would send:\n" + text + "\n---")
-        return True
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-    if not token or not chat_id:
-        print("[skip] TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set", file=sys.stderr)
-        return False
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = urllib.parse.urlencode({
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": "true",
-    }).encode()
-    req = urllib.request.Request(url, data=payload)
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            body = resp.read()
-        if b'"ok":true' in body:
-            return True
-        print(f"[error] Telegram send returned non-ok: {body[:200]!r}", file=sys.stderr)
-        return False
-    except Exception as e:
-        print(f"[error] Telegram send failed: {e}", file=sys.stderr)
-        return False
-
-
-def format_message(read: ps.ActionableRead) -> str:
-    """Format a single alert as HTML for Telegram."""
+def format_message(read: ps.ActionableRead, position: pf.Position | None = None) -> str:
+    """Format a single alert as HTML for Telegram. If the ticker is an owned
+    position, prepend a holdings/P&L line so a breakdown on a name you HOLD
+    reads as a risk alert, not just an opportunity."""
     chg_sign = "+" if read.chg_pct >= 0 else ""
     dir_arrow = "▲" if read.direction == "BREAKOUT" else "▼"
 
@@ -171,6 +144,16 @@ def format_message(read: ps.ActionableRead) -> str:
         lines.append(read.headline_detail)
     if read.headline_level:
         lines.append(f"Level: <code>{read.headline_level}</code>")
+
+    if position is not None and position.is_owned and position.entry and read.last_price > 0:
+        pl = (read.last_price / position.entry - 1) * 100.0
+        pl_sign = "+" if pl >= 0 else ""
+        risk = " ⚠️" if read.direction == "BREAKDOWN" else ""
+        lines.append(
+            f"📦 <b>HELD</b>{risk} {position.shares:g} sh @ "
+            f"<code>${position.entry:.2f}</code> · P/L {pl_sign}{pl:.1f}%"
+        )
+
     lines.append(f"<i>{read.tier_label} · score {int(read.score)}</i>")
     return "\n".join(lines)
 
@@ -193,10 +176,11 @@ def main() -> int:
         print(f"[skip] outside market hours ({now_et}) — no alerts sent")
         return 0
 
-    tickers = load_portfolio()
+    tickers = pf.load_portfolio()
     if not tickers:
         print("[skip] no portfolio configured (set SCAN_PORTFOLIO or portfolio.txt)")
         return 0
+    positions = pf.positions_map()
 
     tier_env = os.environ.get("ALERT_TIERS", "").strip()
     alert_tiers = (
@@ -230,13 +214,22 @@ def main() -> int:
     print(f"[alert] attempting {len(new_alerts)} new alerts")
     # Best-effort send the batch header — even if it fails, the per-ticker
     # messages below carry their own context so the user still gets the data.
-    _send_telegram(format_batch_header(len(new_alerts), len(tickers)))
+    notify.send_message(format_batch_header(len(new_alerts), len(tickers)))
 
     delivered = 0
     for r in new_alerts:
-        if _send_telegram(format_message(r)):
+        pos = positions.get(r.ticker)
+        # Render the daily chart with the firing level emphasized. Best-effort:
+        # a None PNG (no kaleido / render error) falls back to a text alert.
+        png = chart_render.render_daily_png(
+            r.result, cfg,
+            highlight={"price": r.trigger_price, "label": r.setup_label,
+                       "direction": r.direction} if r.trigger_price else None,
+        )
+        if notify.send_alert(format_message(r, pos), png_bytes=png):
             already.add(alert_key(r))
             delivered += 1
+            notify.append_jsonl(ALERT_LOG_FILE, alert_record(r))
         else:
             print(f"[retry] {r.ticker} delivery failed — will retry next run", file=sys.stderr)
 

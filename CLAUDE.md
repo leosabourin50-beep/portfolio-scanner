@@ -41,7 +41,30 @@ to the detection / setup-map logic flow into both. Only the UI and the new
 
 5. **Same Bloomberg-terminal aesthetic** as single-name-screener (phosphor
    green / amber / cyan / warning-red on near-black, JetBrains Mono +
-   Inter). The CSS is mirrored from the single-name app.
+   Inter). The CSS is mirrored from the single-name app. `chart_render.py`
+   re-mirrors the daily-chart palette so alert PNGs match — it deliberately
+   does NOT import `app.py` (that would pull Streamlit into the worker).
+
+6. **Telegram delivery is shared via `notify.py`.** Don't reintroduce a local
+   `_send_telegram`. The daily cron and the intraday watcher run on SEPARATE
+   bot tokens (`TELEGRAM_BOT_TOKEN` vs `TELEGRAM_WATCHER_BOT_TOKEN`); the
+   watcher binds a `notify.Notifier` to its own token. Charts are best-effort:
+   `notify.send_alert` falls back to text if the PNG is None or fails.
+
+7. **The interactive command bot lives in the watcher only.** Telegram allows
+   one `getUpdates` consumer per token, and the cron is ephemeral — so
+   `telegram_commands.run_command_loop` runs as a daemon thread inside
+   `intraday_watcher.py`. Don't add a second long-poller.
+
+8. **Portfolio + positions go through `portfolio.py`.** It parses the
+   `TICKER [N @ ENTRY]` format, prefers the volume-backed runtime file once
+   edited via Telegram, and owns the mute/snooze store. Both the cron and the
+   watcher import it instead of re-reading `portfolio.txt`.
+
+9. **Dedup state is no longer committed to git.** The cron persists
+   `.alerts_state.json` + `.alert_log.jsonl` via the Actions cache; the watcher
+   keeps its state on the Fly `/data` volume. The committed `.alerts_state.json`
+   in the repo is legacy and can be deleted.
 
 ## Architecture
 
@@ -60,7 +83,15 @@ portfolio-scanner/
 ├── commentary.py               # SHARED — used in drill-down view
 ├── portfolio_scanner.py        # NEW — parallel scan + actionability ranking
 ├── app.py                      # NEW — portfolio-first Streamlit UI
+├── scanner_cron.py             # Daily-tier Telegram alerts (GitHub Actions cron)
+├── intraday_watcher.py         # Long-running Fly worker — intraday level/violent alerts
+├── notify.py                   # Shared Telegram delivery (message/photo) + alert log
+├── chart_render.py             # Analyzer result -> PNG (best-effort, kaleido)
+├── portfolio.py                # Portfolio + positions + mute/snooze state
+├── telegram_commands.py        # Interactive command bot (runs in the watcher)
+├── scorecard.py                # Weekly forward-return signal scorecard
 ├── Dockerfile                  # Inherited
+├── Dockerfile.watcher          # Fly worker image (runs intraday_watcher.py)
 └── .streamlit/config.toml      # Inherited
 ```
 

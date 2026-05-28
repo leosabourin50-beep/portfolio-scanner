@@ -14,8 +14,11 @@ on:
         required: false
         default: 'false'
 
+# Read-only: dedup state is persisted via actions/cache now, not committed
+# back to the repo, so the job no longer needs write access (and no longer
+# floods git history with "update alert state" commits or risks push races).
 permissions:
-  contents: write    # so the job can commit .alerts_state.json back
+  contents: read
 
 concurrency:
   group: scanner-cron
@@ -33,6 +36,19 @@ jobs:
           python-version: '3.11'
           cache: pip
 
+      # Restore the dedup state + alert log from the most recent run. A unique
+      # key means the exact key never hits, so the cache is always (re)saved at
+      # job end with the latest state; restore-keys pulls the newest prior one.
+      - name: Restore alert state
+        uses: actions/cache@v4
+        with:
+          path: |
+            .alerts_state.json
+            .alert_log.jsonl
+          key: scanner-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            scanner-state-
+
       - name: Install dependencies
         run: pip install -r requirements.txt
 
@@ -43,15 +59,3 @@ jobs:
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
           DRY_RUN:            ${{ github.event.inputs.dry_run == 'true' && '1' || '0' }}
         run: python scanner_cron.py
-
-      - name: Commit alert state if changed
-        run: |
-          if [[ -n "$(git status --porcelain .alerts_state.json)" ]]; then
-            git config user.name  "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add .alerts_state.json
-            git commit -m "chore: update alert dedup state [skip ci]"
-            git push
-          else
-            echo "No state changes to commit."
-          fi
