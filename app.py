@@ -1033,7 +1033,7 @@ def _render_drilldown(read: ps.ActionableRead, cfg: dict) -> None:
 # ─────────────────────────────────────────────────
 
 DEFAULT_PORTFOLIO = (
-    "AMZN, GEV, GOOGL, KLAC, LITE, LRCX, NVDA, PH, RYCEY, STM, TSLA, URI"
+    "AMZN, GEV, GOOGL, KLAC, LITE, LRCX, NVDA, RYCEY, SNDK, STM, TSLA, URI"
 )
 
 
